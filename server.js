@@ -4,6 +4,20 @@ const { google } = require("googleapis");
 
 const app = express();
 
+/* =====================
+   ENV CHECK (ช่วย debug)
+===================== */
+const must = (k) => {
+  if (!process.env[k]) console.error(`❌ Missing env: ${k}`);
+};
+must("LINE_CHANNEL_ACCESS_TOKEN");
+must("LINE_CHANNEL_SECRET");
+must("GOOGLE_SERVICE_ACCOUNT");
+must("SPREADSHEET_ID");
+
+/* =====================
+   LINE CONFIG
+===================== */
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -17,7 +31,8 @@ const client = new line.messagingApi.MessagingApiClient({
    GOOGLE SHEETS SETUP
 ===================== */
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "DATA"; // ใช้แท็บ DATA
+const DATA_SHEET = process.env.SHEET_NAME || "DATA"; // ใช้แท็บ DATA
+const ASSET_SHEET = "ASSET"; // ใช้แท็บ ASSET
 
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}"),
@@ -32,42 +47,75 @@ function toMonthKey(date = new Date()) {
   return `${y}-${m}`;
 }
 
+/**
+ * ASSET ตามรูปของคุณ:
+ * A AssetCode | B AssetType | C ProjectName | D UnitNo | E FullName | F Owner | ...
+ */
 async function lookupAsset(assetCode) {
-  // อ่านจากแท็บ ASSET: A:AssetCode B:AssetName C:Project
+  if (!assetCode) return { assetName: "", project: "", unitNo: "", assetType: "" };
+
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `ASSET!A:C`,
+    range: `'${ASSET_SHEET}'!A:E`,
   });
 
   const rows = res.data.values || [];
-  // rows[0] คือ header
   for (let i = 1; i < rows.length; i++) {
-    const [code, name, project] = rows[i];
-    if ((code || "").trim() === assetCode) {
+    const [code, assetType, projectName, unitNo, fullName] = rows[i] || [];
+    if ((code || "").trim() === assetCode.trim()) {
       return {
-        assetName: name || "",
-        project: project || "",
+        assetName: (fullName || "").trim(),
+        project: (projectName || "").trim(),
+        unitNo: (unitNo || "").trim(),
+        assetType: (assetType || "").trim(),
       };
     }
   }
-  return { assetName: "", project: "" };
+  return { assetName: "", project: "", unitNo: "", assetType: "" };
 }
 
+/**
+ * DATA A:K ตามที่ใช้ในโค้ดนี้
+ * A Timestamp
+ * B Type (รับ/จ่าย)
+ * C Amount
+ * D Detail
+ * E AssetCode
+ * F AssetName
+ * G Category
+ * H RoomOrNo
+ * I Project
+ * J Month
+ * K UserId
+ */
 async function appendToDataRow(row) {
-  // ลง A:K ของแท็บ DATA
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:K`,
+    range: `'${DATA_SHEET}'!A:K`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
 }
 
+function guessCategory(detail) {
+  if (detail.includes("ค่าเช่า")) return "ค่าเช่า";
+  if (detail.includes("ค่าน้ำ")) return "ค่าน้ำ";
+  if (detail.includes("ค่าไฟ")) return "ค่าไฟ";
+  if (detail.includes("ส่วนกลาง")) return "ค่าส่วนกลาง";
+  if (detail.includes("ซ่อม")) return "ซ่อมบำรุง";
+  return "อื่นๆ";
+}
+
+function extractRoomOrNo(detail) {
+  // ดึง "ห้อง101" หรือ "ห้อง 75/5"
+  const roomMatch = detail.match(/ห้อง\s*([0-9\/\-]+)/);
+  return roomMatch ? roomMatch[1] : "";
+}
+
 async function summary(month, assetCode = "") {
-  // อ่าน DATA ทั้งช่วง A:K แล้วรวม
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:K`,
+    range: `'${DATA_SHEET}'!A:K`,
   });
 
   const rows = res.data.values || [];
@@ -75,14 +123,15 @@ async function summary(month, assetCode = "") {
   let expense = 0;
 
   for (let i = 1; i < rows.length; i++) {
-    const r = rows[i];
-    const type = (r[1] || "").trim();     // B
-    const amount = Number(r[2] || 0);     // C
-    const rAsset = (r[4] || "").trim();   // E
-    const rMonth = (r[9] || "").trim();   // J
+    const r = rows[i] || [];
+    const type = (r[1] || "").trim();       // B
+    const amount = Number(r[2] || 0);       // C
+    const rAssetCode = (r[4] || "").trim(); // E
+    const rMonth = (r[9] || "").trim();     // J
 
+    if (!rMonth) continue;
     if (rMonth !== month) continue;
-    if (assetCode && rAsset !== assetCode) continue;
+    if (assetCode && rAssetCode !== assetCode) continue;
 
     if (type === "รับ") income += amount;
     if (type === "จ่าย") expense += amount;
@@ -95,18 +144,25 @@ async function summary(month, assetCode = "") {
    WEBHOOK
 ===================== */
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  res.status(200).end(); // ตอบ LINE ทันที
+  // ตอบ LINE ทันที (สำคัญ)
+  res.status(200).end();
 
   try {
     const events = req.body?.events || [];
+
     for (const event of events) {
       if (event.type !== "message" || event.message.type !== "text") continue;
 
       const userId = event.source?.userId || "";
       const raw = event.message.text || "";
-      const text = raw.replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 
-      // ✅ คำสั่งสรุป: "สรุป 2026-03 @H-GP59" หรือ "สรุป 2026-03"
+      // Normalize ช่องว่างแปลกของ LINE
+      const text = raw
+        .replace(/\u00A0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      // ✅ สรุป: "สรุป 2026-03" หรือ "สรุป 2026-03 @C1"
       const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/);
       if (sumMatch) {
         const month = sumMatch[1];
@@ -127,8 +183,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // ✅ บันทึก: "รับ 5000 ค่าเช่า @H-GP59"
-      // รูปแบบ: (รับ/จ่าย) (จำนวน) (รายละเอียด...) (@AssetCode optional)
+      // ✅ บันทึก: "รับ 5000 ค่าเช่า @H1" / "จ่าย 120 ค่าน้ำ @C1"
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) {
         await client.replyMessage({
@@ -137,16 +192,16 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
             type: "text",
             text:
               "รูปแบบบันทึก:\n" +
-              "รับ 5000 ค่าเช่า @H-GP59\n" +
-              "จ่าย 350 ค่าน้ำ @C-R22\n\n" +
-              "สรุป:\nสรุป 2026-03\nสรุป 2026-03 @H-GP59",
+              "รับ 5000 ค่าเช่า @H1\n" +
+              "จ่าย 120 ค่าน้ำ @C1\n\n" +
+              "สรุป:\nสรุป 2026-03\nสรุป 2026-03 @H1",
           }],
         });
         continue;
       }
 
-      const type = m[1];                 // รับ/จ่าย
-      const amount = m[2];
+      const type = m[1];          // รับ/จ่าย
+      const amountStr = m[2];
       const detailAll = m[3];
 
       // ดึง @AssetCode จากท้ายข้อความ (ถ้ามี)
@@ -157,39 +212,37 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const now = new Date();
       const monthKey = toMonthKey(now);
 
+      // lookup จาก ASSET
       let assetName = "";
       let project = "";
+      let unitNo = "";
+      let assetType = "";
+
       if (assetCode) {
         const found = await lookupAsset(assetCode);
         assetName = found.assetName;
         project = found.project;
+        unitNo = found.unitNo;
+        assetType = found.assetType;
       }
 
-      // Category เดาง่าย ๆ จาก detail (ปรับทีหลังได้)
-      let category = "";
-      if (detail.includes("ค่าเช่า")) category = "ค่าเช่า";
-      else if (detail.includes("ค่าน้ำ")) category = "ค่าน้ำ";
-      else if (detail.includes("ค่าไฟ")) category = "ค่าไฟ";
-      else if (detail.includes("ส่วนกลาง")) category = "ค่าส่วนกลาง";
-      else if (detail.includes("ซ่อม")) category = "ซ่อมบำรุง";
-      else category = "อื่นๆ";
+      const category = guessCategory(detail);
+      const roomOrNo = extractRoomOrNo(detail) || unitNo; // ถ้ามี unit ใน ASSET ก็เติมให้
 
-      // RoomOrNo (ดึงเลขห้อง/บ้าน ถ้ามีคำว่า ห้องxxx)
-      const roomMatch = detail.match(/ห้อง\s*([0-9\/\-]+)/);
-      const roomOrNo = roomMatch ? roomMatch[1] : "";
+      const amount = Number(amountStr);
 
       const row = [
-        now.toLocaleString("th-TH"),      // A Timestamp
-        type,                              // B Type
-        Number(amount),                    // C Amount
-        detail,                            // D Detail
-        assetCode,                         // E AssetCode
-        assetName,                         // F AssetName
-        category,                          // G Category
-        roomOrNo,                          // H RoomOrNo
-        project,                           // I Project
-        monthKey,                          // J Month
-        userId,                            // K UserId
+        now.toLocaleString("th-TH"), // A Timestamp
+        type,                        // B Type
+        amount,                      // C Amount
+        detail,                      // D Detail
+        assetCode,                   // E AssetCode
+        assetName,                   // F AssetName (FullName)
+        category,                    // G Category
+        roomOrNo,                    // H RoomOrNo
+        project,                     // I Project
+        monthKey,                    // J Month
+        userId,                      // K UserId
       ];
 
       await appendToDataRow(row);
@@ -200,9 +253,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           type: "text",
           text:
             `บันทึกแล้ว ✅\n` +
-            `${type} ${Number(amount).toLocaleString()} บาท\n` +
+            `${type} ${amount.toLocaleString()} บาท\n` +
             `${detail}\n` +
-            `${assetCode ? `ทรัพย์: ${assetCode}${assetName ? ` (${assetName})` : ""}` : "ทรัพย์: (ยังไม่ระบุ)"}`,
+            `${assetCode ? `ทรัพย์: ${assetCode}${assetName ? ` (${assetName})` : ""}` : "ทรัพย์: (ยังไม่ระบุ)"}` +
+            `${assetType ? `\nประเภท: ${assetType}` : ""}` +
+            `${project ? `\nโครงการ: ${project}` : ""}`,
         }],
       });
     }
@@ -211,6 +266,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
+/* =====================
+   HEALTH CHECK
+===================== */
 app.get("/", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
