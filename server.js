@@ -8,11 +8,14 @@ app.get("/", (req, res) => {
   res.send("LINE BOT RUNNING");
 });
 
+// ✅ ตัวเช็กว่าเส้นทาง /webhook มีจริง (สำหรับ debug)
+app.get("/webhook", (req, res) => {
+  res.send("WEBHOOK OK");
+});
+
 // ✅ webhook สำหรับ LINE
 app.post("/webhook", (req, res) => {
   console.log("Webhook received:", req.body);
-
-  // ตอบ LINE ทันที (สำคัญมาก)
   res.sendStatus(200);
 });
 
