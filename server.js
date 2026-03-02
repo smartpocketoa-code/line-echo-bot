@@ -3,12 +3,11 @@ const line = require("@line/bot-sdk");
 const { google } = require("googleapis");
 
 const app = express();
-app.use(express.json()); // ✅ สำคัญมาก กัน req.body ว่าง
+app.use(express.json()); // ✅ กัน req.body ว่าง
 
 /* =====================
    LINE CONFIG
 ===================== */
-
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -21,7 +20,6 @@ const client = new line.messagingApi.MessagingApiClient({
 /* =====================
    GOOGLE SHEET
 ===================== */
-
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
 const auth = new google.auth.GoogleAuth({
@@ -47,18 +45,24 @@ async function saveToSheet(type, amount, note) {
 /* =====================
    WEBHOOK
 ===================== */
-
 app.post("/webhook", line.middleware(config), async (req, res) => {
   res.sendStatus(200);
 
   try {
-    const events = req.body?.events || []; // ✅ กันพัง
+    const events = req.body?.events || [];
+    if (!events.length) return;
 
     for (const event of events) {
       if (event.type !== "message" || event.message.type !== "text") continue;
 
-      const text = (event.message.text || "").trim();
-      const match = text.match(/^(รับ|จ่าย)\s+(\d+(?:\.\d+)?)\s+(.+)$/);
+      // ✅ Normalize ช่องว่างแปลกของ LINE + รวม space หลายตัว
+      const text = (event.message.text || "")
+        .replace(/\u00A0/g, " ") // non-breaking space
+        .replace(/\s+/g, " ")
+        .trim();
+
+      // ✅ ยืดหยุ่น: "รับ5000 ค่าเช่า" / "รับ 5000  ค่าเช่า" ได้หมด
+      const match = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
 
       if (match) {
         const type = match[1];
@@ -69,12 +73,22 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: "text", text: `บันทึกแล้ว ✅\n${type} ${amount} บาท\n${note}` }],
+          messages: [
+            {
+              type: "text",
+              text: `บันทึกแล้ว ✅\n${type} ${amount} บาท\n${note}`,
+            },
+          ],
         });
       } else {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: "text", text: "รูปแบบ: รับ 5000 ค่าเช่า ห้อง101" }],
+          messages: [
+            {
+              type: "text",
+              text: "รูปแบบบันทึก:\nรับ 5000 ค่าเช่า ห้อง101\nจ่าย 120 ค่าน้ำ",
+            },
+          ],
         });
       }
     }
@@ -86,7 +100,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 /* =====================
    HEALTH CHECK
 ===================== */
-
 app.get("/", (req, res) => {
   res.send("LINE BOT + SHEET READY ✅");
 });
