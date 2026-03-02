@@ -42,20 +42,23 @@ let categoryCache = { loadedAt: 0, list: [] };
 async function loadCategoryIfNeeded() {
   const now = Date.now();
   if (now - categoryCache.loadedAt < 60000 && categoryCache.list.length) return;
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${CATEGORY_SHEET}!A:B` });
-  const rows = res.data.values || [];
-  const list = [];
-  for (let i = 1; i < rows.length; i++) {
-    const [kw, cat] = rows[i];
-    if (kw && cat) list.push({ keyword: normalizeText(kw), category: normalizeText(cat) });
-  }
-  categoryCache = { loadedAt: now, list };
+  try {
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${CATEGORY_SHEET}!A:B` });
+    const rows = res.data.values || [];
+    const list = [];
+    for (let i = 1; i < rows.length; i++) {
+      const [kw, cat] = rows[i];
+      if (kw && cat) list.push({ keyword: normalizeText(kw), category: normalizeText(cat) });
+    }
+    categoryCache = { loadedAt: now, list };
+  } catch (err) { console.error("Load Category Error:", err); }
 }
 
 async function detectCategory(detail) {
   await loadCategoryIfNeeded();
+  const d = detail.toLowerCase();
   for (const item of categoryCache.list) {
-    if (detail.toLowerCase().includes(item.keyword.toLowerCase())) return item.category;
+    if (d.includes(item.keyword.toLowerCase())) return item.category;
   }
   return "อื่นๆ";
 }
@@ -71,7 +74,10 @@ async function loadAssetsIfNeeded() {
   const map = new Map();
   for (let i = 1; i < rows.length; i++) {
     const [code, type, project, unit, name, owner, active] = rows[i];
-    if (code) map.set(normalizeText(code), { assetCode: code, assetType: type, fullName: name, owner: owner, projectName: project });
+    if (code) {
+      const c = normalizeText(code).toUpperCase();
+      map.set(c, { assetCode: c, assetType: type, fullName: name, owner: owner, projectName: project });
+    }
   }
   return map;
 }
@@ -88,39 +94,49 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const text = normalizeText(event.message.text);
 
-      // --- 1. คำสั่ง "สรุป" ---
+      // --- 1. คำสั่งสรุปยอด ---
       const summaryMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/i);
       if (summaryMatch) {
-        const targetMonth = summaryMatch[1];
-        const targetAsset = summaryMatch[2] ? normalizeText(summaryMatch[2]) : null;
+        const targetMonth = summaryMatch[1]; 
+        const targetAsset = summaryMatch[2] ? normalizeText(summaryMatch[2]).toUpperCase() : null;
 
         const resData = await sheets.spreadsheets.values.get({
           spreadsheetId: SPREADSHEET_ID,
-          range: `${SHEET_NAME}!B:J`,
+          range: `${SHEET_NAME}!A:O`, 
         });
 
         const rows = resData.data.values || [];
-        let totalIncome = 0, totalExpense = 0;
+        let totalIncome = 0;
+        let totalExpense = 0;
 
-        for (const row of rows) {
-          const [type, amount, , , assetCode, , , , monthKey] = row;
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row[9]) continue; // ถ้าไม่มีคอลัมน์ J (Month) ให้ข้าม
+
+          const type = normalizeText(row[1] || ""); 
+          const amount = parseFloat(String(row[2] || "0").replace(/,/g, "")) || 0;
+          const assetCode = normalizeText(row[4] || "").toUpperCase();
+          const monthKey = normalizeText(row[9] || "");
+
           if (monthKey === targetMonth) {
-            if (!targetAsset || (assetCode && normalizeText(assetCode) === targetAsset)) {
-              const val = parseFloat(String(amount).replace(/,/g, "")) || 0;
-              if (type === "รับ") totalIncome += val;
-              else if (type === "จ่าย") totalExpense += val;
+            if (!targetAsset || assetCode === targetAsset) {
+              if (type === "รับ") totalIncome += amount;
+              else if (type === "จ่าย") totalExpense += amount;
             }
           }
         }
 
         let replySum = `📊 สรุปยอด ${targetAsset ? targetAsset : "ภาพรวม"}\n📅 เดือน: ${targetMonth}\n`;
-        replySum += `-------------------------\n🟢 รับ: ${totalIncome.toLocaleString()} บาท\n🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
+        replySum += `-------------------------\n`;
+        replySum += `🟢 รับ: ${totalIncome.toLocaleString()} บาท\n`;
+        replySum += `🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n`;
+        replySum += `💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
 
         await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: replySum }] });
         continue;
       }
 
-      // --- 2. คำสั่ง "บันทึก" (รับ/จ่าย) ---
+      // --- 2. คำสั่งบันทึก (รับ/จ่าย) ---
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) continue;
 
@@ -128,15 +144,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const amount = Number(amountStr);
       const assetMatch = detailAll.match(/(.*)\s+(@[A-Za-z0-9\-]+)\s*$/);
       const detailRaw = assetMatch ? normalizeText(assetMatch[1]) : detailAll;
-      const assetCode = assetMatch ? normalizeText(assetMatch[2]) : "";
+      const assetCode = assetMatch ? normalizeText(assetMatch[2]).toUpperCase() : "";
 
-      // ดึง PaymentMethod (#) และ Ref (*)
       const payMatch = detailRaw.match(/#(\S+)/);
       const refMatch = detailRaw.match(/\*(\S+)/);
       const paymentMethod = payMatch ? payMatch[1] : "";
       const ref = refMatch ? refMatch[1] : "";
-
-      // ตัดสัญลักษณ์พิเศษออกจากรายละเอียดเพื่อให้ชื่อรายการสะอาด
       const cleanDetail = detailRaw.replace(/#\S+/g, "").replace(/\*\S+/g, "").trim();
 
       const timestamp = getThaiTimestamp();
@@ -144,16 +157,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const asset = assetMap.get(assetCode) || {};
       const category = await detectCategory(cleanDetail);
       const room = extractRoom(cleanDetail);
+      const monthKey = new Date().getFullYear() + "-" + String(new Date().getMonth() + 1).padStart(2, "0");
 
       const row = [
         timestamp, type, amount, cleanDetail, assetCode, asset.fullName || "",
-        category, room, asset.projectName || "", 
-        new Date().getFullYear() + "-" + String(new Date().getMonth() + 1).padStart(2, "0"), 
-        event.source.userId, 
-        paymentMethod, // L
-        ref,           // M
-        asset.owner || "", // N
-        asset.assetType || "" // O
+        category, room, asset.projectName || "", monthKey, event.source.userId,
+        paymentMethod, ref, asset.owner || "", asset.assetType || ""
       ];
 
       await sheets.spreadsheets.values.append({
@@ -165,17 +174,13 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       let reply = `บันทึกแล้ว ✅\n${type} ${amount.toLocaleString()} บาท\nรายการ: ${category}\n`;
       if (paymentMethod) reply += `ช่องทาง: ${paymentMethod}\n`;
-      if (ref) reply += `อ้างอิง: ${ref}\n`;
-      if (assetCode) {
-        reply += `รหัสทรัพย์: ${assetCode}${asset.fullName ? ` (${asset.fullName})` : ""}\n`;
-        reply += `ผู้ชำระเงิน: ${asset.owner || ""}\nประเภททรัพย์สิน: ${asset.assetType || ""}\n`;
-      }
-      reply += `รับชำระเมื่อ: ${timestamp}`;
+      if (assetCode) reply += `รหัสทรัพย์: ${assetCode}\nผู้ชำระเงิน: ${asset.owner || ""}\n`;
+      reply += `เมื่อ: ${timestamp}`;
 
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: reply.trim() }] });
     }
-  } catch (e) { console.error("Error:", e); }
+  } catch (e) { console.error("Webhook Error:", e); }
 });
 
-app.get("/", (req, res) => res.send("OK ✅"));
+app.get("/", (req, res) => res.send("System Active ✅"));
 app.listen(process.env.PORT || 8080);
