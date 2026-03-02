@@ -1,25 +1,44 @@
 const express = require("express");
 
 const app = express();
+
+/* =========================
+   IMPORTANT: Railway + LINE
+========================= */
+
+// ให้ Express อ่าน body แบบ raw ด้วย (LINE ต้องการ)
 app.use(express.json());
 
-// หน้าเว็บหลัก
+// หน้าเว็บหลัก (ใช้เช็คว่า server online)
 app.get("/", (req, res) => {
-  res.send("LINE BOT RUNNING");
+  res.status(200).send("LINE BOT RUNNING ✅");
 });
 
-// ✅ ตัวเช็กว่าเส้นทาง /webhook มีจริง (สำหรับ debug)
+// route debug เช็ค webhook
 app.get("/webhook", (req, res) => {
-  res.send("WEBHOOK OK");
+  res.status(200).send("WEBHOOK OK ✅");
 });
 
-// ✅ webhook สำหรับ LINE
+// ✅ LINE Webhook endpoint
 app.post("/webhook", (req, res) => {
-  console.log("Webhook received:", req.body);
+  console.log("Webhook received:", JSON.stringify(req.body));
+
+  // ต้องตอบ 200 ทันที ไม่งั้น Verify ไม่ผ่าน
   res.sendStatus(200);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server started on port " + PORT);
+/* =========================
+   Railway PORT (สำคัญมาก)
+========================= */
+
+const PORT = process.env.PORT;
+
+if (!PORT) {
+  console.error("❌ PORT is not defined!");
+  process.exit(1);
+}
+
+// ต้อง bind 0.0.0.0 สำหรับ Railway
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
