@@ -1,44 +1,59 @@
 const express = require("express");
+const line = require("@line/bot-sdk");
 
 const app = express();
 
-/* =========================
-   IMPORTANT: Railway + LINE
-========================= */
+/* =====================
+   LINE CONFIG
+===================== */
 
-// ให้ Express อ่าน body แบบ raw ด้วย (LINE ต้องการ)
-app.use(express.json());
+const config = {
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET,
+};
 
-// หน้าเว็บหลัก (ใช้เช็คว่า server online)
+const client = new line.messagingApi.MessagingApiClient({
+  channelAccessToken: config.channelAccessToken,
+});
+
+/* =====================
+   WEBHOOK
+===================== */
+
+app.post("/webhook", line.middleware(config), async (req, res) => {
+  res.sendStatus(200); // ตอบ LINE ทันที
+
+  try {
+    const events = req.body.events;
+
+    for (const event of events) {
+      if (event.type === "message" && event.message.type === "text") {
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [
+            {
+              type: "text",
+              text: `คุณพิมพ์ว่า: ${event.message.text}`,
+            },
+          ],
+        });
+      }
+    }
+  } catch (err) {
+    console.error("Reply error:", err);
+  }
+});
+
+/* =====================
+   HEALTH CHECK
+===================== */
+
 app.get("/", (req, res) => {
-  res.status(200).send("LINE BOT RUNNING ✅");
+  res.send("LINE BOT RUNNING ✅");
 });
-
-// route debug เช็ค webhook
-app.get("/webhook", (req, res) => {
-  res.status(200).send("WEBHOOK OK ✅");
-});
-
-// ✅ LINE Webhook endpoint
-app.post("/webhook", (req, res) => {
-  console.log("Webhook received:", JSON.stringify(req.body));
-
-  // ต้องตอบ 200 ทันที ไม่งั้น Verify ไม่ผ่าน
-  res.sendStatus(200);
-});
-
-/* =========================
-   Railway PORT (สำคัญมาก)
-========================= */
 
 const PORT = process.env.PORT;
 
-if (!PORT) {
-  console.error("❌ PORT is not defined!");
-  process.exit(1);
-}
-
-// ต้อง bind 0.0.0.0 สำหรับ Railway
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log("Server running on port " + PORT);
 });
