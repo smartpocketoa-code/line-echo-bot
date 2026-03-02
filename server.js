@@ -3,6 +3,7 @@ const line = require("@line/bot-sdk");
 const { google } = require("googleapis");
 
 const app = express();
+app.use(express.json()); // ✅ สำคัญมาก กัน req.body ว่าง
 
 /* =====================
    LINE CONFIG
@@ -21,22 +22,24 @@ const client = new line.messagingApi.MessagingApiClient({
    GOOGLE SHEET
 ===================== */
 
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+
 const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT),
+  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}"),
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 
 const sheets = google.sheets({ version: "v4", auth });
 
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-
 async function saveToSheet(type, amount, note) {
+  if (!SPREADSHEET_ID) throw new Error("Missing SPREADSHEET_ID");
+
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: "Sheet1!A:D",
     valueInputOption: "USER_ENTERED",
     requestBody: {
-      values: [[new Date().toLocaleString(), type, amount, note]],
+      values: [[new Date().toLocaleString("th-TH"), type, Number(amount), note]],
     },
   });
 }
@@ -49,12 +52,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   res.sendStatus(200);
 
   try {
-    for (const event of req.body.events) {
-      if (event.type !== "message" || event.message.type !== "text")
-        continue;
+    const events = req.body?.events || []; // ✅ กันพัง
 
-      const text = event.message.text;
+    for (const event of events) {
+      if (event.type !== "message" || event.message.type !== "text") continue;
 
+      const text = (event.message.text || "").trim();
       const match = text.match(/^(รับ|จ่าย)\s+(\d+(?:\.\d+)?)\s+(.+)$/);
 
       if (match) {
@@ -66,27 +69,17 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [
-            {
-              type: "text",
-              text: `บันทึกแล้ว ✅ ${type} ${amount} บาท ${note}`,
-            },
-          ],
+          messages: [{ type: "text", text: `บันทึกแล้ว ✅\n${type} ${amount} บาท\n${note}` }],
         });
       } else {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [
-            {
-              type: "text",
-              text: "รูปแบบ: รับ 5000 ค่าเช่า ห้อง101",
-            },
-          ],
+          messages: [{ type: "text", text: "รูปแบบ: รับ 5000 ค่าเช่า ห้อง101" }],
         });
       }
     }
   } catch (err) {
-    console.error(err);
+    console.error("SHEET/REPLY ERROR:", err);
   }
 });
 
@@ -99,7 +92,6 @@ app.get("/", (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port " + PORT);
 });
