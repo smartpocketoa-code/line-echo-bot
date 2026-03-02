@@ -14,44 +14,10 @@ const client = new line.messagingApi.MessagingApiClient({
 });
 
 /* =====================
-   ASSETS (รหัสทรัพย์ของคุณ)
-===================== */
-const ASSETS = {
-  H1: { type: "บ้าน", name: "แกรนด์พลีโน่ 59/90" },
-  C1: { type: "คอนโด", name: "Unio72-2 278/136" },
-  C2: { type: "คอนโด", name: "Regent Home 22 75/5" },
-};
-
-/* =====================
-   CATEGORY RULES
-===================== */
-function detectCategory(text) {
-  const t = text.toLowerCase();
-
-  // รายรับ
-  if (t.includes("ค่าเช่า")) return "ค่าเช่า";
-  if (t.includes("ค่าจอดรถ")) return "ค่าจอดรถ";
-  if (t.includes("ค่าปรับ")) return "ค่าปรับ";
-
-  // รายจ่าย
-  if (t.includes("ค่าน้ำ")) return "ค่าน้ำ";
-  if (t.includes("ค่าไฟ")) return "ค่าไฟ";
-  if (t.includes("ค่าส่วนกลาง")) return "ค่าส่วนกลาง";
-  if (t.includes("อินเทอร์เน็ต") || t.includes("เน็ตทรู") || t.includes("ais") || t.includes("true"))
-    return "อินเทอร์เน็ต";
-  if (t.includes("ซ่อม") || t.includes("ช่าง") || t.includes("อะไหล่")) return "ซ่อมบำรุง";
-  if (t.includes("ทำความสะอาด") || t.includes("แม่บ้าน")) return "ทำความสะอาด";
-  if (t.includes("เฟอร์") || t.includes("ของใช้")) return "เฟอร์นิเจอร์/ของใช้";
-  if (t.includes("ภาษี") || t.includes("ประกัน")) return "ภาษี/ประกัน";
-  if (t.includes("ค่าธรรมเนียม") || t.includes("fee")) return "ค่าธรรมเนียม";
-
-  return "อื่นๆ";
-}
-
-/* =====================
-   GOOGLE SHEET
+   GOOGLE SHEETS SETUP
 ===================== */
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const SHEET_NAME = process.env.SHEET_NAME || "DATA"; // ใช้แท็บ DATA
 
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}"),
@@ -60,54 +26,69 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 
 function toMonthKey(date = new Date()) {
+  // YYYY-MM
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
   return `${y}-${m}`;
 }
 
-async function appendToSheet(row) {
-  if (!SPREADSHEET_ID) throw new Error("Missing SPREADSHEET_ID");
+async function lookupAsset(assetCode) {
+  // อ่านจากแท็บ ASSET: A:AssetCode B:AssetName C:Project
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `ASSET!A:C`,
+  });
 
-  // ✅ ใช้ชื่อแท็บ DATA ตามของคุณ
+  const rows = res.data.values || [];
+  // rows[0] คือ header
+  for (let i = 1; i < rows.length; i++) {
+    const [code, name, project] = rows[i];
+    if ((code || "").trim() === assetCode) {
+      return {
+        assetName: name || "",
+        project: project || "",
+      };
+    }
+  }
+  return { assetName: "", project: "" };
+}
+
+async function appendToDataRow(row) {
+  // ลง A:K ของแท็บ DATA
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: "DATA!A:K",
+    range: `${SHEET_NAME}!A:K`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
 }
 
-/* =====================
-   PARSER: "รับ 5000 ค่าเช่า ห้อง101 @C1"
-===================== */
-function normalizeText(s = "") {
-  return s.replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
-}
+async function summary(month, assetCode = "") {
+  // อ่าน DATA ทั้งช่วง A:K แล้วรวม
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!A:K`,
+  });
 
-function parseMessage(text) {
-  const t = normalizeText(text);
+  const rows = res.data.values || [];
+  let income = 0;
+  let expense = 0;
 
-  // จับ @AssetCode ท้ายบรรทัด
-  const assetMatch = t.match(/@([A-Za-z0-9]+)\s*$/);
-  if (!assetMatch) return { ok: false, reason: "missing_asset" };
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const type = (r[1] || "").trim();     // B
+    const amount = Number(r[2] || 0);     // C
+    const rAsset = (r[4] || "").trim();   // E
+    const rMonth = (r[9] || "").trim();   // J
 
-  const assetCode = assetMatch[1].toUpperCase();
-  const asset = ASSETS[assetCode];
-  if (!asset) return { ok: false, reason: "unknown_asset" };
+    if (rMonth !== month) continue;
+    if (assetCode && rAsset !== assetCode) continue;
 
-  // ตัด @xxx ออก
-  const withoutAsset = t.replace(/@([A-Za-z0-9]+)\s*$/, "").trim();
+    if (type === "รับ") income += amount;
+    if (type === "จ่าย") expense += amount;
+  }
 
-  // จับ type + amount + detail
-  const m = withoutAsset.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/);
-  if (!m) return { ok: false, reason: "bad_format" };
-
-  const type = m[1];
-  const amount = Number(m[2]);
-  const detail = m[3].trim();
-  const category = detectCategory(detail);
-
-  return { ok: true, type, amount, detail, category, assetCode, assetName: asset.name };
+  return { income, expense, net: income - expense };
 }
 
 /* =====================
@@ -118,62 +99,111 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
   try {
     const events = req.body?.events || [];
-
     for (const event of events) {
       if (event.type !== "message" || event.message.type !== "text") continue;
 
-      const text = event.message.text || "";
-      const parsed = parseMessage(text);
+      const userId = event.source?.userId || "";
+      const raw = event.message.text || "";
+      const text = raw.replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 
-      if (!parsed.ok) {
-        let msg = "รูปแบบไม่ถูกต้อง ❌\n\nตัวอย่าง:\nรับ 5000 ค่าเช่า ห้อง101 @C1\nจ่าย 1200 ค่าน้ำ @H1\n\nรหัสทรัพย์: @H1 @C1 @C2";
-        if (parsed.reason === "unknown_asset") msg = "ไม่รู้จักรหัสทรัพย์ ❌\nใช้ได้แค่ @H1 @C1 @C2";
-        if (parsed.reason === "missing_asset") msg = "ต้องใส่รหัสทรัพย์ท้ายข้อความ ❌\nเช่น @H1 หรือ @C1 หรือ @C2";
+      // ✅ คำสั่งสรุป: "สรุป 2026-03 @H-GP59" หรือ "สรุป 2026-03"
+      const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/);
+      if (sumMatch) {
+        const month = sumMatch[1];
+        const assetCode = (sumMatch[2] || "").trim();
+        const s = await summary(month, assetCode);
+
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [{ type: "text", text: msg }],
+          messages: [{
+            type: "text",
+            text:
+              `สรุปเดือน ${month}${assetCode ? ` (${assetCode})` : ""}\n` +
+              `รายรับ: ${s.income.toLocaleString()} บาท\n` +
+              `รายจ่าย: ${s.expense.toLocaleString()} บาท\n` +
+              `คงเหลือ: ${s.net.toLocaleString()} บาท`,
+          }],
         });
         continue;
       }
 
+      // ✅ บันทึก: "รับ 5000 ค่าเช่า @H-GP59"
+      // รูปแบบ: (รับ/จ่าย) (จำนวน) (รายละเอียด...) (@AssetCode optional)
+      const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
+      if (!m) {
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{
+            type: "text",
+            text:
+              "รูปแบบบันทึก:\n" +
+              "รับ 5000 ค่าเช่า @H-GP59\n" +
+              "จ่าย 350 ค่าน้ำ @C-R22\n\n" +
+              "สรุป:\nสรุป 2026-03\nสรุป 2026-03 @H-GP59",
+          }],
+        });
+        continue;
+      }
+
+      const type = m[1];                 // รับ/จ่าย
+      const amount = m[2];
+      const detailAll = m[3];
+
+      // ดึง @AssetCode จากท้ายข้อความ (ถ้ามี)
+      const assetMatch = detailAll.match(/(.*)\s+(@[A-Za-z0-9\-]+)\s*$/);
+      const detail = assetMatch ? assetMatch[1].trim() : detailAll.trim();
+      const assetCode = assetMatch ? assetMatch[2].trim() : "";
+
       const now = new Date();
       const monthKey = toMonthKey(now);
-      const ts = now.toLocaleString("th-TH");
 
-      const income = parsed.type === "รับ" ? parsed.amount : 0;
-      const expense = parsed.type === "จ่าย" ? parsed.amount : 0;
-      const net = income - expense;
+      let assetName = "";
+      let project = "";
+      if (assetCode) {
+        const found = await lookupAsset(assetCode);
+        assetName = found.assetName;
+        project = found.project;
+      }
 
-      // A-K ตามแบบที่ออกแบบไว้
+      // Category เดาง่าย ๆ จาก detail (ปรับทีหลังได้)
+      let category = "";
+      if (detail.includes("ค่าเช่า")) category = "ค่าเช่า";
+      else if (detail.includes("ค่าน้ำ")) category = "ค่าน้ำ";
+      else if (detail.includes("ค่าไฟ")) category = "ค่าไฟ";
+      else if (detail.includes("ส่วนกลาง")) category = "ค่าส่วนกลาง";
+      else if (detail.includes("ซ่อม")) category = "ซ่อมบำรุง";
+      else category = "อื่นๆ";
+
+      // RoomOrNo (ดึงเลขห้อง/บ้าน ถ้ามีคำว่า ห้องxxx)
+      const roomMatch = detail.match(/ห้อง\s*([0-9\/\-]+)/);
+      const roomOrNo = roomMatch ? roomMatch[1] : "";
+
       const row = [
-        ts,                     // A Timestamp
-        parsed.type,            // B Type
-        parsed.amount,          // C Amount
-        parsed.assetCode,       // D AssetCode
-        parsed.assetName,       // E AssetName
-        parsed.category,        // F Category
-        parsed.detail,          // G Detail
-        monthKey,               // H Month
-        income,                 // I Income
-        expense,                // J Expense
-        net,                    // K Net
+        now.toLocaleString("th-TH"),      // A Timestamp
+        type,                              // B Type
+        Number(amount),                    // C Amount
+        detail,                            // D Detail
+        assetCode,                         // E AssetCode
+        assetName,                         // F AssetName
+        category,                          // G Category
+        roomOrNo,                          // H RoomOrNo
+        project,                           // I Project
+        monthKey,                          // J Month
+        userId,                            // K UserId
       ];
 
-      await appendToSheet(row);
+      await appendToDataRow(row);
 
       await client.replyMessage({
         replyToken: event.replyToken,
-        messages: [
-          {
-            type: "text",
-            text:
-              `บันทึกแล้ว ✅\n` +
-              `${parsed.assetCode} (${parsed.assetName})\n` +
-              `${parsed.type} ${parsed.amount} บาท\n` +
-              `หมวด: ${parsed.category}\n` +
-              `${parsed.detail}`,
-          },
-        ],
+        messages: [{
+          type: "text",
+          text:
+            `บันทึกแล้ว ✅\n` +
+            `${type} ${Number(amount).toLocaleString()} บาท\n` +
+            `${detail}\n` +
+            `${assetCode ? `ทรัพย์: ${assetCode}${assetName ? ` (${assetName})` : ""}` : "ทรัพย์: (ยังไม่ระบุ)"}`,
+        }],
       });
     }
   } catch (e) {
