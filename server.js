@@ -1,166 +1,5 @@
-const express = require("express");
-const line = require("@line/bot-sdk");
-const { google } = require("googleapis");
-
-const app = express();
-
 /* =====================
-   LINE CONFIG
-===================== */
-const config = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-};
-
-const client = new line.messagingApi.MessagingApiClient({
-  channelAccessToken: config.channelAccessToken,
-});
-
-/* =====================
-   GOOGLE SHEETS SETUP
-===================== */
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "DATA"; 
-const ASSET_SHEET = "ASSET";
-const CATEGORY_SHEET = "CATEGORY";
-
-if (!SPREADSHEET_ID) {
-  console.error("❌ Missing env: SPREADSHEET_ID");
-}
-
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}"),
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-const sheets = google.sheets({ version: "v4", auth });
-
-function toMonthKey(date = new Date()) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  return `${y}-${m}`;
-}
-
-function normalizeText(s = "") {
-  return String(s)
-    .replace(/\u00A0/g, " ") 
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/* =====================
-   CACHE
-===================== */
-let categoryCache = { loadedAt: 0, list: [] };
-let assetCache = { loadedAt: 0, map: new Map() };
-
-const CACHE_TTL_MS = 60 * 1000; 
-
-async function loadCategoryIfNeeded() {
-  const now = Date.now();
-  if (now - categoryCache.loadedAt < CACHE_TTL_MS && categoryCache.list.length) return;
-
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${CATEGORY_SHEET}!A:B`,
-  });
-
-  const rows = res.data.values || [];
-  const list = [];
-
-  for (let i = 1; i < rows.length; i++) {
-    const [keywordRaw, categoryRaw] = rows[i];
-    const category = normalizeText(categoryRaw);
-    if (!keywordRaw || !category) continue;
-
-    const keywords = String(keywordRaw)
-      .split(",")
-      .map((k) => normalizeText(k))
-      .filter(Boolean);
-
-    for (const k of keywords) {
-      list.push({ keyword: k, category });
-    }
-  }
-
-  list.sort((a, b) => b.keyword.length - a.keyword.length);
-  categoryCache = { loadedAt: now, list };
-}
-
-async function loadAssetsIfNeeded() {
-  const now = Date.now();
-  if (now - assetCache.loadedAt < CACHE_TTL_MS && assetCache.map.size) return;
-
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${ASSET_SHEET}!A:H`,
-  });
-
-  const rows = res.data.values || [];
-  const map = new Map();
-
-  for (let i = 1; i < rows.length; i++) {
-    const [
-      assetCode,
-      assetType,
-      projectName,
-      unitNo,
-      fullName,
-      owner,
-      active,
-      note,
-    ] = rows[i];
-
-    const code = normalizeText(assetCode);
-    if (!code) continue;
-
-    map.set(code, {
-      assetCode: code,
-      assetType: normalizeText(assetType),
-      projectName: normalizeText(projectName),
-      unitNo: normalizeText(unitNo),
-      fullName: normalizeText(fullName),
-      owner: normalizeText(owner),
-      active: String(active).toUpperCase() === "TRUE",
-      note: normalizeText(note),
-    });
-  }
-
-  assetCache = { loadedAt: now, map };
-}
-
-async function lookupAsset(assetCode) {
-  await loadAssetsIfNeeded();
-  return assetCache.map.get(assetCode) || null;
-}
-
-async function detectCategory(detail) {
-  await loadCategoryIfNeeded();
-  const d = detail.toLowerCase();
-
-  for (const item of categoryCache.list) {
-    if (d.includes(item.keyword.toLowerCase())) {
-      return item.category;
-    }
-  }
-  return "อื่นๆ";
-}
-
-function extractRoom(detail) {
-  const m = detail.match(/ห้อง\s*([0-9\/\-]+)/);
-  return m ? m[1] : "";
-}
-
-async function appendToDataRow(row) {
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:K`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: { values: [row] },
-  });
-}
-
-/* =====================
-   WEBHOOK
+   WEBHOOK (ส่วนที่ปรับปรุงการตอบกลับและชื่อหัวข้อ)
 ===================== */
 app.post("/webhook", line.middleware(config), async (req, res) => {
   res.status(200).end();
@@ -173,6 +12,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const userId = event.source?.userId || "";
       const text = normalizeText(event.message.text || "");
 
+      // รูปแบบ: "รับ 5000 ค่าเช่า @C1"
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
 
       if (!m) {
@@ -202,11 +42,21 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const now = new Date();
       const monthKey = toMonthKey(now);
+      
+      // สร้างรูปแบบวันที่สำหรับแสดงผลใน LINE
+      const timestampThai = now.toLocaleString("th-TH", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
 
       let assetName = "";
       let project = "";
       let owner = "";
-      let assetType = ""; // เพิ่มตัวแปรสำหรับ AssetType
+      let assetType = ""; 
       let active = true;
 
       if (assetCode) {
@@ -215,7 +65,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           assetName = asset.fullName || "";
           project = asset.projectName || "";
           owner = asset.owner || "";
-          assetType = asset.assetType || ""; // ดึงค่าจากคอลัมน์ B ในแท็บ ASSET
+          assetType = asset.assetType || ""; 
           active = asset.active !== false;
         }
       }
@@ -236,31 +86,36 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const category = await detectCategory(detail);
       const room = extractRoom(detail);
 
+      // บันทึกลง Google Sheets (ใช้ค่า timestampThai เพื่อให้อ่านง่ายในชีตด้วย)
       const row = [
-        now.toLocaleString("th-TH"), 
-        type,                        
-        amount,                      
-        detail,                      
-        assetCode,                   
-        assetName,                   
-        category,                    
-        room,                        
-        project,                     
-        monthKey,                    
-        userId,                      
+        timestampThai, // A Timestamp
+        type,          // B Type
+        amount,        // C Amount
+        detail,        // D Detail
+        assetCode,     // E AssetCode
+        assetName,     // F AssetName
+        category,      // G Category
+        room,          // H Room
+        project,       // I Project
+        monthKey,      // J Month
+        userId,        // K User
       ];
 
       await appendToDataRow(row);
 
-      // --- ปรับปรุงส่วนการตอบกลับตามที่คุณต้องการ ---
-      let reply =
-        `บันทึกแล้ว ✅\n` +
-        `${type} ${amount.toLocaleString()} บาท\n` +
-        `${category}\n` +
-        (assetCode ? `ทรัพย์: ${assetCode}${assetName ? ` (${assetName})` : ""}\n` : "ทรัพย์: (ยังไม่ระบุ)\n");
+      // --- สร้างข้อความตอบกลับตามเงื่อนไขใหม่ ---
+      let reply = `บันทึกแล้ว ✅\n`;
+      reply += `${type} ${amount.toLocaleString()} บาท\n`;
+      reply += `รายการ: ${category}\n`;
+      reply += assetCode 
+        ? `รหัสทรัพย์: ${assetCode}${assetName ? ` (${assetName})` : ""}\n` 
+        : `รหัสทรัพย์: (ยังไม่ระบุ)\n`;
 
-      if (owner) reply += `Owner: ${owner}\n`;
-      if (assetType) reply += `AssetType: ${assetType}`; // เปลี่ยนจาก Note เป็น AssetType
+      if (owner) reply += `ผู้ชำระเงิน: ${owner}\n`;
+      if (assetType) reply += `ประเภททรัพย์สิน: ${assetType}\n`;
+      
+      // เพิ่มบรรทัดวันที่ชำระ (รับชำระเมื่อ)
+      reply += `รับชำระเมื่อ: ${timestampThai}`;
 
       await client.replyMessage({
         replyToken: event.replyToken,
@@ -271,8 +126,3 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
     console.error("WEBHOOK ERROR:", e);
   }
 });
-
-app.get("/", (req, res) => res.send("OK ✅"));
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => console.log("Server running on", PORT));
