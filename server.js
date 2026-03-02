@@ -25,9 +25,11 @@ const sheets = google.sheets({ version: "v4", auth });
 async function saveToSheet(type, amount, note) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: "Sheet1!A:D",
+    range: "DATA!A:D", // ✅ เปลี่ยนตรงนี้
     valueInputOption: "USER_ENTERED",
-    requestBody: { values: [[new Date().toLocaleString("th-TH"), type, Number(amount), note]] },
+    requestBody: {
+      values: [[new Date().toLocaleString("th-TH"), type, Number(amount), note]],
+    },
   });
 }
 
@@ -40,16 +42,21 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
     for (const event of events) {
       if (event.type !== "message" || event.message.type !== "text") continue;
 
-      const text = (event.message.text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
-      const match = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/);
+      const text = (event.message.text || "")
+        .replace(/\u00A0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
+      const match = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/);
       if (!match) continue;
 
       await saveToSheet(match[1], match[2], match[3]);
 
       await client.replyMessage({
         replyToken: event.replyToken,
-        messages: [{ type: "text", text: `บันทึกแล้ว ✅\n${match[1]} ${match[2]} บาท\n${match[3]}` }],
+        messages: [
+          { type: "text", text: `บันทึกแล้ว ✅\n${match[1]} ${match[2]} บาท\n${match[3]}` },
+        ],
       });
     }
   } catch (e) {
