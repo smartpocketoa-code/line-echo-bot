@@ -20,7 +20,7 @@ const client = new line.messagingApi.MessagingApiClient({
    GOOGLE SHEETS SETUP
 ===================== */
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const SHEET_NAME = process.env.SHEET_NAME || "DATA"; // DATA tab
+const SHEET_NAME = process.env.SHEET_NAME || "DATA"; 
 const ASSET_SHEET = "ASSET";
 const CATEGORY_SHEET = "CATEGORY";
 
@@ -42,18 +42,18 @@ function toMonthKey(date = new Date()) {
 
 function normalizeText(s = "") {
   return String(s)
-    .replace(/\u00A0/g, " ") // NBSP from some clients
+    .replace(/\u00A0/g, " ") 
     .replace(/\s+/g, " ")
     .trim();
 }
 
 /* =====================
-   CACHE (ลดการอ่านชีตทุกครั้ง)
+   CACHE
 ===================== */
 let categoryCache = { loadedAt: 0, list: [] };
 let assetCache = { loadedAt: 0, map: new Map() };
 
-const CACHE_TTL_MS = 60 * 1000; // 60s
+const CACHE_TTL_MS = 60 * 1000; 
 
 async function loadCategoryIfNeeded() {
   const now = Date.now();
@@ -72,7 +72,6 @@ async function loadCategoryIfNeeded() {
     const category = normalizeText(categoryRaw);
     if (!keywordRaw || !category) continue;
 
-    // รองรับทั้ง "ค่าเช่า" และ "ค่าเช่า, เช่า"
     const keywords = String(keywordRaw)
       .split(",")
       .map((k) => normalizeText(k))
@@ -83,9 +82,7 @@ async function loadCategoryIfNeeded() {
     }
   }
 
-  // เรียง keyword ยาวก่อน เพื่อให้ match คำยาวก่อน (เช่น "ค่าส่วนกลาง" > "ส่วนกลาง")
   list.sort((a, b) => b.keyword.length - a.keyword.length);
-
   categoryCache = { loadedAt: now, list };
 }
 
@@ -149,7 +146,6 @@ async function detectCategory(detail) {
 }
 
 function extractRoom(detail) {
-  // ดึงเลขห้อง/บ้านแบบง่าย ๆ
   const m = detail.match(/ห้อง\s*([0-9\/\-]+)/);
   return m ? m[1] : "";
 }
@@ -164,10 +160,10 @@ async function appendToDataRow(row) {
 }
 
 /* =====================
-   WEBHOOK (สำคัญ: ไม่ใส่ express.json ก่อน)
+   WEBHOOK
 ===================== */
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  res.status(200).end(); // ตอบ LINE ทันที
+  res.status(200).end();
 
   try {
     const events = req.body?.events || [];
@@ -177,7 +173,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const userId = event.source?.userId || "";
       const text = normalizeText(event.message.text || "");
 
-      // รูปแบบ: "รับ 5000 ค่าเช่า @C1" / "จ่าย120 ค่าน้ำ @C1"
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
 
       if (!m) {
@@ -201,7 +196,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const amount = Number(m[2]);
       const detailAll = normalizeText(m[3]);
 
-      // ดึง @AssetCode จากท้ายข้อความ (ถ้ามี)
       const assetMatch = detailAll.match(/(.*)\s+(@[A-Za-z0-9\-]+)\s*$/);
       const detail = assetMatch ? normalizeText(assetMatch[1]) : detailAll;
       const assetCode = assetMatch ? normalizeText(assetMatch[2]) : "";
@@ -212,7 +206,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       let assetName = "";
       let project = "";
       let owner = "";
-      let note = "";
+      let assetType = ""; // เพิ่มตัวแปรสำหรับ AssetType
       let active = true;
 
       if (assetCode) {
@@ -221,21 +215,18 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           assetName = asset.fullName || "";
           project = asset.projectName || "";
           owner = asset.owner || "";
-          note = asset.note || "";
+          assetType = asset.assetType || ""; // ดึงค่าจากคอลัมน์ B ในแท็บ ASSET
           active = asset.active !== false;
         }
       }
 
-      // ถ้าทรัพย์ถูกปิด (Active=FALSE) ไม่ให้บันทึก
       if (assetCode && !active) {
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [
             {
               type: "text",
-              text:
-                `ทรัพย์ ${assetCode} ถูกปิดใช้งาน (Active=FALSE) ❌\n` +
-                `กรุณาเปิดในแท็บ ASSET ก่อน แล้วลองใหม่`,
+              text: `ทรัพย์ ${assetCode} ถูกปิดใช้งาน (Active=FALSE) ❌\nกรุณาเปิดในแท็บ ASSET ก่อน แล้วลองใหม่`,
             },
           ],
         });
@@ -246,22 +237,22 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const room = extractRoom(detail);
 
       const row = [
-        now.toLocaleString("th-TH"), // A Timestamp
-        type,                        // B Type
-        amount,                      // C Amount
-        detail,                      // D Detail
-        assetCode,                   // E AssetCode
-        assetName,                   // F AssetName
-        category,                    // G Category
-        room,                        // H Room
-        project,                     // I Project
-        monthKey,                    // J Month
-        userId,                      // K User
+        now.toLocaleString("th-TH"), 
+        type,                        
+        amount,                      
+        detail,                      
+        assetCode,                   
+        assetName,                   
+        category,                    
+        room,                        
+        project,                     
+        monthKey,                    
+        userId,                      
       ];
 
       await appendToDataRow(row);
 
-      // ตอบกลับแบบที่คุณต้องการ
+      // --- ปรับปรุงส่วนการตอบกลับตามที่คุณต้องการ ---
       let reply =
         `บันทึกแล้ว ✅\n` +
         `${type} ${amount.toLocaleString()} บาท\n` +
@@ -269,7 +260,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         (assetCode ? `ทรัพย์: ${assetCode}${assetName ? ` (${assetName})` : ""}\n` : "ทรัพย์: (ยังไม่ระบุ)\n");
 
       if (owner) reply += `Owner: ${owner}\n`;
-      if (note) reply += `Note: ${note}`;
+      if (assetType) reply += `AssetType: ${assetType}`; // เปลี่ยนจาก Note เป็น AssetType
 
       await client.replyMessage({
         replyToken: event.replyToken,
@@ -281,7 +272,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
-/* health check */
 app.get("/", (req, res) => res.send("OK ✅"));
 
 const PORT = process.env.PORT || 8080;
