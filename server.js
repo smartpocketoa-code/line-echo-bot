@@ -4,51 +4,29 @@ const { google } = require("googleapis");
 
 const app = express();
 
-/* =====================
-   LINE CONFIG
-===================== */
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
+// LINE client
 const client = new line.messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken,
 });
 
 /* =====================
-   GOOGLE SHEETS CONFIG
+   GOOGLE SHEETS SETUP
 ===================== */
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const DATA_SHEET = process.env.SHEET_NAME || "DATA"; // ใช้แท็บ DATA
+const DATA_SHEET = process.env.SHEET_NAME || "DATA";
 const ASSET_SHEET = "ASSET";
+const CATEGORY_SHEET = "CATEGORY";
 
-function assertEnv() {
-  const need = [
-    "LINE_CHANNEL_ACCESS_TOKEN",
-    "LINE_CHANNEL_SECRET",
-    "GOOGLE_SERVICE_ACCOUNT",
-    "SPREADSHEET_ID",
-  ];
-  const missing = need.filter((k) => !process.env[k]);
-  if (missing.length) {
-    throw new Error("Missing env: " + missing.join(", "));
-  }
-}
-
-const googleAuth = new google.auth.GoogleAuth({
+const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || "{}"),
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
-
-let sheetsClient = null;
-async function sheets() {
-  if (!sheetsClient) {
-    const authClient = await googleAuth.getClient();
-    sheetsClient = google.sheets({ version: "v4", auth: authClient });
-  }
-  return sheetsClient;
-}
+const sheets = google.sheets({ version: "v4", auth });
 
 function toMonthKey(date = new Date()) {
   const y = date.getFullYear();
@@ -56,92 +34,110 @@ function toMonthKey(date = new Date()) {
   return `${y}-${m}`;
 }
 
-function normalizeText(s = "") {
-  return String(s)
-    .replace(/\u00A0/g, " ") // NBSP
+function normalizeText(s) {
+  return (s || "")
+    .replace(/\u00A0/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function detectCategory(detail) {
-  if (detail.includes("ค่าเช่า")) return "ค่าเช่า";
-  if (detail.includes("ค่าน้ำ")) return "ค่าน้ำ";
-  if (detail.includes("ค่าไฟ")) return "ค่าไฟ";
-  if (detail.includes("ส่วนกลาง")) return "ค่าส่วนกลาง";
-  if (detail.includes("ซ่อม")) return "ซ่อมบำรุง";
-  return "อื่นๆ";
-}
-
-function extractRoomOrNo(detail) {
-  // "ห้อง 278/136" หรือ "ห้อง101"
-  const m = detail.match(/ห้อง\s*([0-9\/\-]+)/);
-  return m ? m[1] : "";
-}
-
-/**
- * lookupAsset ใช้คอลัมน์ A-H จากแท็บ ASSET:
- * A AssetCode | B AssetType | C ProjectName | D UnitNo | E FullName | F Owner | G Active | H Note
- */
+/* =====================
+   LOOKUP: ASSET
+   ASSET columns:
+   A AssetCode | B AssetType | C ProjectName | D UnitNo | E FullName | F Owner | G Active | H Note
+===================== */
 async function lookupAsset(assetCode) {
-  const sh = await sheets();
-  const res = await sh.spreadsheets.values.get({
+  if (!assetCode) return null;
+
+  const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `'${ASSET_SHEET}'!A:H`,
+    range: `${ASSET_SHEET}!A:H`,
   });
 
   const rows = res.data.values || [];
   for (let i = 1; i < rows.length; i++) {
-    const [
-      code,
-      assetType,
-      projectName,
-      unitNo,
-      fullName,
-      owner,
-      active,
-      note,
-    ] = rows[i];
-
-    if (normalizeText(code) === normalizeText(assetCode)) {
-      const activeBool = String(active || "").toUpperCase() === "TRUE";
+    const r = rows[i];
+    const code = (r[0] || "").trim(); // A
+    if (code === assetCode) {
       return {
-        assetCode: normalizeText(code),
-        assetType: assetType || "",
-        projectName: projectName || "",
-        unitNo: unitNo || "",
-        fullName: fullName || "",
-        owner: owner || "",
-        active: activeBool,
-        note: note || "",
+        assetCode: code,
+        assetType: r[1] || "",
+        project: r[2] || "",
+        unitNo: r[3] || "",
+        assetName: r[4] || "",
+        owner: r[5] || "",
+        active: String(r[6] || "").toUpperCase() === "TRUE",
+        note: r[7] || "",
       };
     }
   }
-
-  return null; // ไม่พบ
+  return null;
 }
 
-/**
- * append DATA A:M (เพิ่ม Owner/AssetNote ต่อท้าย)
- */
-async function appendToDataRow(rowAtoM) {
-  const sh = await sheets();
-  await sh.spreadsheets.values.append({
+/* =====================
+   LOOKUP: CATEGORY (keyword -> category)
+   CATEGORY columns: A Keyword | B Category
+===================== */
+async function loadCategoryRules() {
+  const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `'${DATA_SHEET}'!A:M`,
+    range: `${CATEGORY_SHEET}!A:B`,
+  });
+
+  const rows = res.data.values || [];
+  const rules = [];
+  for (let i = 1; i < rows.length; i++) {
+    const kw = (rows[i][0] || "").trim();
+    const cat = (rows[i][1] || "").trim();
+    if (kw && cat) rules.push({ kw, cat });
+  }
+  return rules;
+}
+
+async function guessCategory(detail) {
+  const d = (detail || "").toLowerCase();
+  const rules = await loadCategoryRules();
+  for (const r of rules) {
+    if (d.includes(r.kw.toLowerCase())) return r.cat;
+  }
+  return "อื่นๆ";
+}
+
+/* =====================
+   APPEND TO DATA
+   DATA columns A–O:
+   A Timestamp
+   B Type
+   C Amount
+   D Detail
+   E AssetCode
+   F AssetName
+   G Category
+   H Room
+   I Project
+   J Month
+   K User
+   L PaymentMethod
+   M Ref
+   N Owner
+   O Note
+===================== */
+async function appendToDataRow(row) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${DATA_SHEET}!A:O`,
     valueInputOption: "USER_ENTERED",
-    requestBody: { values: [rowAtoM] },
+    requestBody: { values: [row] },
   });
 }
 
-/**
- * summary รวมจาก DATA:
- * B Type, C Amount, E AssetCode, J Month
- */
+/* =====================
+   SUMMARY
+===================== */
 async function summary(month, assetCode = "") {
-  const sh = await sheets();
-  const res = await sh.spreadsheets.values.get({
+  const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `'${DATA_SHEET}'!A:M`,
+    range: `${DATA_SHEET}!A:O`,
   });
 
   const rows = res.data.values || [];
@@ -150,13 +146,13 @@ async function summary(month, assetCode = "") {
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
-    const type = normalizeText(r[1]); // B
-    const amount = Number(r[2] || 0); // C
-    const rAsset = normalizeText(r[4]); // E
-    const rMonth = normalizeText(r[9]); // J
+    const type = (r[1] || "").trim();      // B
+    const amount = Number(r[2] || 0);      // C
+    const rAsset = (r[4] || "").trim();    // E
+    const rMonth = (r[9] || "").trim();    // J
 
     if (rMonth !== month) continue;
-    if (assetCode && rAsset !== normalizeText(assetCode)) continue;
+    if (assetCode && rAsset !== assetCode) continue;
 
     if (type === "รับ") income += amount;
     if (type === "จ่าย") expense += amount;
@@ -166,26 +162,64 @@ async function summary(month, assetCode = "") {
 }
 
 /* =====================
-   WEBHOOK (ห้ามใส่ express.json ก่อนอันนี้)
+   PARSE MESSAGE
+   ตัวอย่าง:
+   "จ่าย 120 ค่าน้ำ @C1 โอน สลิป123"
+===================== */
+function parseSaveCommand(text) {
+  // รับ/จ่าย + จำนวน + ข้อความที่เหลือ
+  const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
+  if (!m) return null;
+
+  const type = m[1];
+  const amount = m[2];
+  let rest = m[3];
+
+  // ดึง @AssetCode (ตัวสุดท้ายที่ขึ้นต้นด้วย @)
+  let assetCode = "";
+  const assetMatch = rest.match(/(.*)\s+(@[A-Za-z0-9_@\-]+)\s*$/);
+  if (assetMatch) {
+    rest = assetMatch[1].trim();
+    assetCode = assetMatch[2].trim();
+  }
+
+  // payment/ref (ถ้ามี) — วิธีง่าย: ถ้าเจอคำว่า เงินสด/โอน/บัตร/อื่นๆ เป็น payment
+  // และคำที่เหลือท้ายสุดให้เป็น ref ถ้ามี
+  let paymentMethod = "";
+  let ref = "";
+
+  const pmMatch = rest.match(/(.*)\s+(เงินสด|โอน|บัตร|อื่นๆ)\s*(.*)$/);
+  if (pmMatch) {
+    rest = pmMatch[1].trim();
+    paymentMethod = pmMatch[2].trim();
+    ref = (pmMatch[3] || "").trim(); // เช่น สลิป123
+  }
+
+  const detail = rest.trim();
+
+  return { type, amount, detail, assetCode, paymentMethod, ref };
+}
+
+/* =====================
+   WEBHOOK
 ===================== */
 app.post("/webhook", line.middleware(config), async (req, res) => {
   res.status(200).end(); // ตอบ LINE ทันที
 
   try {
-    assertEnv();
-
     const events = req.body?.events || [];
+
     for (const event of events) {
       if (event.type !== "message" || event.message.type !== "text") continue;
 
       const userId = event.source?.userId || "";
-      const text = normalizeText(event.message.text || "");
+      const text = normalizeText(event.message.text);
 
-      // 1) สรุป: "สรุป 2026-03" หรือ "สรุป 2026-03 @C1"
-      const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-_]+))?$/);
+      // สรุป
+      const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9_@\-]+))?$/);
       if (sumMatch) {
         const month = sumMatch[1];
-        const assetCode = normalizeText(sumMatch[2] || "");
+        const assetCode = (sumMatch[2] || "").trim();
         const s = await summary(month, assetCode);
 
         await client.replyMessage({
@@ -202,85 +236,70 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // 2) บันทึก: "รับ 5000 ค่าเช่า ห้อง101 @C1" (ใส่ @ ที่ไหนก็ได้)
-      // ดึง @AssetCode ถ้ามี
-      const assetMatch = text.match(/(@[A-Za-z0-9\-_]+)/);
-      const assetCode = assetMatch ? normalizeText(assetMatch[1]) : "";
-
-      // ลบ assetCode ออกจากข้อความ เพื่อ parse ง่าย
-      const textNoAsset = assetCode ? normalizeText(text.replace(assetCode, "")) : text;
-
-      const m = textNoAsset.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
-      if (!m) {
+      // บันทึก
+      const cmd = parseSaveCommand(text);
+      if (!cmd) {
         await client.replyMessage({
           replyToken: event.replyToken,
           messages: [{
             type: "text",
             text:
               "รูปแบบบันทึก:\n" +
-              "รับ 5000 ค่าเช่า ห้อง101 @H1\n" +
-              "จ่าย 350 ค่าน้ำ @C1\n\n" +
+              "รับ 5000 ค่าเช่า @C1\n" +
+              "จ่าย 120 ค่าน้ำ @C1 โอน สลิป123\n\n" +
               "สรุป:\nสรุป 2026-03\nสรุป 2026-03 @C1",
           }],
         });
         continue;
       }
 
-      const type = m[1];                 // รับ/จ่าย
-      const amount = Number(m[2]);
-      const detail = normalizeText(m[3]);
-
-      // ถ้าใส่ assetCode → lookup
-      let asset = null;
-      if (assetCode) {
-        asset = await lookupAsset(assetCode);
-        if (!asset) {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{
-              type: "text",
-              text: `ไม่พบทรัพย์ ${assetCode} ในแท็บ ASSET ❌\nเช็กว่า AssetCode ตรงกันไหม`,
-            }],
-          });
-          continue;
-        }
-
-        // Active = FALSE → ห้ามบันทึก
-        if (!asset.active) {
-          await client.replyMessage({
-            replyToken: event.replyToken,
-            messages: [{
-              type: "text",
-              text:
-                `ทรัพย์ ${asset.assetCode} ถูกปิดใช้งาน (Active=FALSE) ❌\n` +
-                `Owner: ${asset.owner || "-"}\n` +
-                `Note: ${asset.note || "-"}`,
-            }],
-          });
-          continue;
-        }
-      }
-
       const now = new Date();
       const monthKey = toMonthKey(now);
 
-      const category = detectCategory(detail);
-      const roomOrNo = extractRoomOrNo(detail);
+      // lookup asset
+      let asset = null;
+      if (cmd.assetCode) asset = await lookupAsset(cmd.assetCode);
+
+      // ถ้าทรัพย์ถูกปิด (Active = FALSE) ให้เตือนและไม่บันทึก
+      if (asset && asset.active === false) {
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{
+            type: "text",
+            text: `ทรัพย์ ${cmd.assetCode} ถูกปิดใช้งาน (Active=FALSE)\nเปิดในแท็บ ASSET ก่อน แล้วค่อยบันทึกอีกครั้ง`,
+          }],
+        });
+        continue;
+      }
+
+      const assetName = asset?.assetName || "";
+      const project = asset?.project || "";
+      const owner = asset?.owner || "";
+      const note = asset?.note || "";
+
+      // category
+      const category = await guessCategory(cmd.detail);
+
+      // room (ถ้ามีคำว่า ห้องxxx หรือมี unitNo จาก asset)
+      const roomMatch = cmd.detail.match(/ห้อง\s*([0-9\/\-]+)/);
+      const room = roomMatch ? roomMatch[1] : (asset?.unitNo || "");
 
       const row = [
-        now.toLocaleString("th-TH"),     // A Timestamp
-        type,                             // B Type
-        amount,                           // C Amount
-        detail,                           // D Detail
-        asset?.assetCode || assetCode || "",     // E AssetCode
-        asset?.fullName || "",            // F AssetName (FullName)
-        category,                         // G Category
-        asset?.unitNo || roomOrNo || "",  // H Room (ถ้ามี unitNo ให้ใช้)
-        asset?.projectName || "",         // I Project
-        monthKey,                         // J Month
-        userId,                           // K User
-        asset?.owner || "",               // L Owner (ใหม่)
-        asset?.note || "",                // M AssetNote (ใหม่)
+        now.toLocaleString("th-TH"),      // A
+        cmd.type,                          // B
+        Number(cmd.amount),                // C
+        cmd.detail,                         // D
+        cmd.assetCode,                      // E
+        assetName,                          // F
+        category,                           // G
+        room,                               // H
+        project,                            // I
+        monthKey,                           // J
+        userId,                             // K
+        cmd.paymentMethod,                  // L
+        cmd.ref,                            // M
+        owner,                              // N
+        note,                               // O
       ];
 
       await appendToDataRow(row);
@@ -291,9 +310,10 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           type: "text",
           text:
             `บันทึกแล้ว ✅\n` +
-            `${type} ${amount.toLocaleString()} บาท\n` +
-            `${detail}\n` +
-            `${asset ? `ทรัพย์: ${asset.assetCode} (${asset.fullName})\nOwner: ${asset.owner || "-"}\nNote: ${asset.note || "-"}` : `ทรัพย์: (ยังไม่ระบุ)`}`,
+            `${cmd.type} ${Number(cmd.amount).toLocaleString()} บาท\n` +
+            `${cmd.detail}\n` +
+            `${cmd.assetCode ? `ทรัพย์: ${cmd.assetCode}${assetName ? ` (${assetName})` : ""}` : "ทรัพย์: (ยังไม่ระบุ)"}\n` +
+            `${cmd.paymentMethod ? `ชำระ: ${cmd.paymentMethod}${cmd.ref ? ` (${cmd.ref})` : ""}` : ""}`,
         }],
       });
     }
@@ -302,9 +322,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
-/* =====================
-   OTHER ROUTES
-===================== */
 app.get("/", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 8080;
