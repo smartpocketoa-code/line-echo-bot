@@ -38,7 +38,6 @@ function getThaiTimestamp() {
   return `${date} ${time}`;
 }
 
-// ระบบ Cache Asset & Category (เหมือนเดิม)
 let categoryCache = { loadedAt: 0, list: [] };
 async function loadCategoryIfNeeded() {
   const now = Date.now();
@@ -89,25 +88,23 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const text = normalizeText(event.message.text);
 
-      // --- 1. ตรวจสอบว่าเป็นคำสั่ง "สรุป" หรือไม่ ---
+      // --- 1. คำสั่ง "สรุป" ---
       const summaryMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/i);
       if (summaryMatch) {
-        const targetMonth = summaryMatch[1]; // เช่น 2026-03
+        const targetMonth = summaryMatch[1];
         const targetAsset = summaryMatch[2] ? normalizeText(summaryMatch[2]) : null;
 
         const resData = await sheets.spreadsheets.values.get({
           spreadsheetId: SPREADSHEET_ID,
-          range: `${SHEET_NAME}!B:J`, // ดึง Type(B), Amount(C), AssetCode(E), Month(J)
+          range: `${SHEET_NAME}!B:J`,
         });
 
         const rows = resData.data.values || [];
-        let totalIncome = 0;
-        let totalExpense = 0;
+        let totalIncome = 0, totalExpense = 0;
 
         for (const row of rows) {
           const [type, amount, , , assetCode, , , , monthKey] = row;
           if (monthKey === targetMonth) {
-            // ถ้าระบุ @AssetCode ให้กรองเฉพาะตัวนั้น ถ้าไม่ระบุให้เอาทั้งหมด
             if (!targetAsset || (assetCode && normalizeText(assetCode) === targetAsset)) {
               const val = parseFloat(String(amount).replace(/,/g, "")) || 0;
               if (type === "รับ") totalIncome += val;
@@ -116,40 +113,47 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           }
         }
 
-        let replySummary = `📊 สรุปยอด ${targetAsset ? targetAsset : "ภาพรวม"}\n📅 เดือน: ${targetMonth}\n`;
-        replySummary += `-------------------------\n`;
-        replySummary += `🟢 รายรับ: ${totalIncome.toLocaleString()} บาท\n`;
-        replySummary += `🔴 รายจ่าย: ${totalExpense.toLocaleString()} บาท\n`;
-        replySummary += `💰 คงเหลือสุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
+        let replySum = `📊 สรุปยอด ${targetAsset ? targetAsset : "ภาพรวม"}\n📅 เดือน: ${targetMonth}\n`;
+        replySum += `-------------------------\n🟢 รับ: ${totalIncome.toLocaleString()} บาท\n🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
 
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ type: "text", text: replySummary }],
-        });
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: replySum }] });
         continue;
       }
 
-      // --- 2. คำสั่ง "บันทึก" (รับ/จ่าย) เดิม ---
+      // --- 2. คำสั่ง "บันทึก" (รับ/จ่าย) ---
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) continue;
 
       const [ , type, amountStr, detailAll] = m;
       const amount = Number(amountStr);
       const assetMatch = detailAll.match(/(.*)\s+(@[A-Za-z0-9\-]+)\s*$/);
-      const detail = assetMatch ? normalizeText(assetMatch[1]) : detailAll;
+      const detailRaw = assetMatch ? normalizeText(assetMatch[1]) : detailAll;
       const assetCode = assetMatch ? normalizeText(assetMatch[2]) : "";
+
+      // ดึง PaymentMethod (#) และ Ref (*)
+      const payMatch = detailRaw.match(/#(\S+)/);
+      const refMatch = detailRaw.match(/\*(\S+)/);
+      const paymentMethod = payMatch ? payMatch[1] : "";
+      const ref = refMatch ? refMatch[1] : "";
+
+      // ตัดสัญลักษณ์พิเศษออกจากรายละเอียดเพื่อให้ชื่อรายการสะอาด
+      const cleanDetail = detailRaw.replace(/#\S+/g, "").replace(/\*\S+/g, "").trim();
 
       const timestamp = getThaiTimestamp();
       const assetMap = await loadAssetsIfNeeded();
       const asset = assetMap.get(assetCode) || {};
-      const category = await detectCategory(detail);
-      const room = extractRoom(detail);
+      const category = await detectCategory(cleanDetail);
+      const room = extractRoom(cleanDetail);
 
       const row = [
-        timestamp, type, amount, detail, assetCode, asset.fullName || "",
+        timestamp, type, amount, cleanDetail, assetCode, asset.fullName || "",
         category, room, asset.projectName || "", 
         new Date().getFullYear() + "-" + String(new Date().getMonth() + 1).padStart(2, "0"), 
-        event.source.userId, "", "", asset.owner || "", asset.assetType || ""
+        event.source.userId, 
+        paymentMethod, // L
+        ref,           // M
+        asset.owner || "", // N
+        asset.assetType || "" // O
       ];
 
       await sheets.spreadsheets.values.append({
@@ -160,17 +164,15 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       });
 
       let reply = `บันทึกแล้ว ✅\n${type} ${amount.toLocaleString()} บาท\nรายการ: ${category}\n`;
+      if (paymentMethod) reply += `ช่องทาง: ${paymentMethod}\n`;
+      if (ref) reply += `อ้างอิง: ${ref}\n`;
       if (assetCode) {
         reply += `รหัสทรัพย์: ${assetCode}${asset.fullName ? ` (${asset.fullName})` : ""}\n`;
-        reply += `ผู้ชำระเงิน: ${asset.owner || ""}\n`;
-        reply += `ประเภททรัพย์สิน: ${asset.assetType || ""}\n`;
+        reply += `ผู้ชำระเงิน: ${asset.owner || ""}\nประเภททรัพย์สิน: ${asset.assetType || ""}\n`;
       }
       reply += `รับชำระเมื่อ: ${timestamp}`;
 
-      await client.replyMessage({
-        replyToken: event.replyToken,
-        messages: [{ type: "text", text: reply.trim() }],
-      });
+      await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: reply.trim() }] });
     }
   } catch (e) { console.error("Error:", e); }
 });
