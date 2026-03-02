@@ -37,12 +37,52 @@ function normalizeText(s = "") {
   return String(s).replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 }
 
-// ฟังก์ชันจัดฟอร์แมตวันที่แบบ ว/ด/ปปปป นน:นน:นน
 function getThaiTimestamp() {
   const now = new Date();
   const date = now.toLocaleDateString("th-TH", { day: 'numeric', month: 'numeric', year: 'numeric' });
   const time = now.toLocaleTimeString("th-TH", { hour12: false });
   return `${date} ${time}`;
+}
+
+// --- เพิ่มระบบ Cache และค้นหาหมวดหมู่ ---
+let categoryCache = { loadedAt: 0, list: [] };
+const CACHE_TTL_MS = 60 * 1000;
+
+async function loadCategoryIfNeeded() {
+  const now = Date.now();
+  if (now - categoryCache.loadedAt < CACHE_TTL_MS && categoryCache.list.length) return;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${CATEGORY_SHEET}!A:B`,
+  });
+
+  const rows = res.data.values || [];
+  const list = [];
+  for (let i = 1; i < rows.length; i++) {
+    const [keywordRaw, categoryRaw] = rows[i];
+    const category = normalizeText(categoryRaw);
+    if (!keywordRaw || !category) continue;
+    const keywords = String(keywordRaw).split(",").map(k => normalizeText(k)).filter(Boolean);
+    for (const k of keywords) { list.push({ keyword: k, category }); }
+  }
+  list.sort((a, b) => b.keyword.length - a.keyword.length);
+  categoryCache = { loadedAt: now, list };
+}
+
+async function detectCategory(detail) {
+  await loadCategoryIfNeeded();
+  const d = detail.toLowerCase();
+  for (const item of categoryCache.list) {
+    if (d.includes(item.keyword.toLowerCase())) return item.category;
+  }
+  return "อื่นๆ";
+}
+
+function extractRoom(detail) {
+  // ดึงเลขหลังคำว่า "ห้อง" หรือรูปแบบตัวเลขที่มีทับ เช่น 123/45
+  const m = detail.match(/ห้อง\s*([0-9\/\-]+)/) || detail.match(/([0-9]+\/[0-9]+)/);
+  return m ? m[1] : "";
 }
 
 async function loadAssetsIfNeeded() {
@@ -57,10 +97,10 @@ async function loadAssetsIfNeeded() {
     if (!code) continue;
     map.set(normalizeText(code), {
       assetCode: normalizeText(code),
-      assetType: normalizeText(type), // คอลัมน์ B: ประเภททรัพย์สิน
+      assetType: normalizeText(type),
       projectName: normalizeText(project),
       fullName: normalizeText(name),
-      owner: normalizeText(owner),    // คอลัมน์ F: ผู้ชำระเงิน
+      owner: normalizeText(owner),
       active: String(active).toUpperCase() === "TRUE",
     });
   }
@@ -92,23 +132,26 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const assetMap = await loadAssetsIfNeeded();
       const asset = assetMap.get(assetCode) || {};
 
-      // เตรียมข้อมูล 15 คอลัมน์ (A-O) ตามโครงสร้างรูปภาพ
+      // --- ประมวลผล Category และ Room ---
+      const category = await detectCategory(detail);
+      const room = extractRoom(detail);
+
       const row = [
-        timestamp,          // A: Timestamp (ฟอร์แมตวันที่แบบไทย)
+        timestamp,          // A: Timestamp
         type,               // B: Type
-        amount,             // C: Amount (รองรับตัวเลข/ทศนิยม)
+        amount,             // C: Amount
         detail,             // D: Detail
         assetCode,          // E: AssetCode
         asset.fullName || "",// F: AssetName
-        "",                 // G: Category (ดึงจากแท็บ CATEGORY ได้ถ้าต้องการ)
-        "",                 // H: Room (ฟังก์ชัน extractRoom)
+        category,           // G: Category (ดึงอัตโนมัติจากแท็บ CATEGORY)
+        room,               // H: Room (ดึงจากรายละเอียดข้อความ)
         asset.projectName || "", // I: Project
         new Date().getFullYear() + "-" + String(new Date().getMonth() + 1).padStart(2, "0"), // J: Month
         event.source.userId,// K: User
         "",                 // L: PaymentMethod
         "",                 // M: Ref
-        asset.owner || "",  // N: Owner (ผู้ชำระเงิน)
-        asset.assetType || "" // O: AssetNote (ประเภททรัพย์สิน)
+        asset.owner || "",  // N: Owner
+        asset.assetType || "" // O: AssetNote
       ];
 
       await sheets.spreadsheets.values.append({
@@ -118,10 +161,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         requestBody: { values: [row] },
       });
 
-      // --- สร้างข้อความตอบกลับตามเงื่อนไขใหม่ ---
       let reply = `บันทึกแล้ว ✅\n`;
       reply += `${type} ${amount.toLocaleString()} บาท\n`;
-      reply += `รายการ: ${detail}\n`;
+      reply += `รายการ: ${category}\n`; // แสดงหมวดหมู่ที่ระบบตรวจเจอ
       if (assetCode) {
         reply += `รหัสทรัพย์: ${assetCode} (${asset.fullName || ""})\n`;
         reply += `ผู้ชำระเงิน: ${asset.owner || ""}\n`;
