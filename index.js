@@ -1,3 +1,4 @@
+app.get("/", (req, res) => res.status(200).send("OK"));
 const express = require("express");
 const line = require("@line/bot-sdk");
 
