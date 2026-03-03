@@ -104,34 +104,58 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const text = normalizeText(event.message.text);
       const timeData = getThaiDateTime();
 
-      // --- 1. คำสั่งสรุปยอด ---
+      // --- 1. สรุปยอด ---
       const summaryMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/i);
       if (summaryMatch) {
-         // (ส่วนนี้ทำงานได้ปกติ ข้ามไปส่วนบันทึกครับ)
-         continue;
+        const targetMonth = summaryMatch[1]; 
+        const targetAsset = summaryMatch[2] ? normalizeText(summaryMatch[2]).toUpperCase() : null;
+        const resData = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_NAME}!A:O` });
+        const rows = resData.data.values || [];
+        let totalIncome = 0, totalExpense = 0, paymentCount = 0, cumulativeIncome = 0;
+
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          const type = normalizeText(row[1] || ""); 
+          const amount = parseFloat(String(row[2] || "0").replace(/,/g, "")) || 0;
+          const assetCode = normalizeText(row[4] || "").toUpperCase();
+          const category = normalizeText(row[6] || ""); 
+          const monthKey = normalizeText(row[9] || ""); 
+
+          if (!targetAsset || assetCode === targetAsset) {
+            if (type === "รับ" && category.includes("ค่าเช่า")) { paymentCount++; cumulativeIncome += amount; }
+            if (monthKey === targetMonth) {
+              if (type === "รับ") totalIncome += amount;
+              else if (type === "จ่าย") totalExpense += amount;
+            }
+          }
+        }
+        let replySum = `📊 สรุปยอด ${targetAsset ? targetAsset : "ภาพรวม"}\n📅 เดือน: ${targetMonth}\n-------------------------\n🟢 รับ: ${totalIncome.toLocaleString()} บาท\n🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
+        if (targetAsset) replySum += `\n-------------------------\n🏠 ชำระค่าเช่าสะสม: ${paymentCount} งวด\n💰 รวมยอดเงิน: ${cumulativeIncome.toLocaleString()} บาท`;
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: replySum }] });
+        continue;
       }
 
-      // --- 2. คำสั่งบันทึก (ปรับปรุง Regex ใหม่ที่นี่) ---
+      // --- 2. บันทึกข้อมูล (แก้ไข Regex ให้แม่นยำขึ้น) ---
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) continue;
 
       const [ , type, amountStr, detailAll] = m;
       const amount = Number(amountStr);
 
-      // --- แก้ไขจุดนี้: แยก Tags ออกจากกันให้แม่นยำ ---
+      // แยกเครื่องหมาย @, #, * ออกจากรายละเอียด
       const assetMatch = detailAll.match(/(@[A-Za-z0-9\-]+)/);
-      const payMatch = detailAll.match(/#(\S+)/);
-      const refMatch = detailAll.match(/\*(\S+)/);
+      const payMatch = detailAll.match(/#([^\s*@#]+)/);
+      const refMatch = detailAll.match(/\*([^\s*@#]+)/);
 
       const assetCode = assetMatch ? assetMatch[1].toUpperCase() : "";
       const paymentMethod = payMatch ? payMatch[1] : "";
       const ref = refMatch ? refMatch[1] : "";
 
-      // คลีนรายละเอียดให้เหลือแต่ข้อความล้วน
+      // คลีนข้อความรายละเอียดให้เหลือแต่เนื้อความ
       let cleanDetail = detailAll
         .replace(/(@[A-Za-z0-9\-]+)/g, "")
-        .replace(/#(\S+)/g, "")
-        .replace(/\*(\S+)/g, "")
+        .replace(/#([^\s*@#]+)/g, "")
+        .replace(/\*([^\s*@#]+)/g, "")
         .trim();
 
       const assetMap = await loadAssetsIfNeeded();
@@ -139,6 +163,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const category = await detectCategory(cleanDetail);
       const room = extractRoom(cleanDetail);
 
+      // จัดข้อมูลลง 15 คอลัมน์ (A-O)
       const row = [
         timeData.full, type, amount, cleanDetail, assetCode, 
         asset.assetName || "", category, room, asset.project || "", 
@@ -151,7 +176,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         valueInputOption: "USER_ENTERED", requestBody: { values: [row] },
       });
 
-      // --- ส่วนการแสดงผล (เพิ่มการโชว์วิธีชำระและอ้างอิง) ---
+      // --- ส่วนการแสดงผลผลลัพธ์ (แก้ไขให้ครบทุก Field ตามภาพที่ต้องการ) ---
       let reply = `บันทึกแล้ว ✅\n`;
       reply += `${type} ${amount.toLocaleString()} บาท\n`;
       reply += `รายการ: ${category}\n`;
