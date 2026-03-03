@@ -31,7 +31,6 @@ function normalizeText(s = "") {
   return String(s).replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 }
 
-// ฟังก์ชันดึงเวลาไทย (GMT+7)
 function getThaiDateTime() {
   const now = new Date();
   const options = { timeZone: 'Asia/Bangkok', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
@@ -42,9 +41,7 @@ function getThaiDateTime() {
   const y = parts.find(p => p.type === 'year').value;
   const time = parts.find(p => p.type === 'hour').value + ":" + parts.find(p => p.type === 'minute').value + ":" + parts.find(p => p.type === 'second').value;
   
-  // สร้าง MonthKey สำหรับคอลัมน์ J (เช่น 2026-03)
   const monthKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit' }).format(now);
-  
   return { full: `${d}/${m}/${y} ${time}`, monthKey: monthKey };
 }
 
@@ -78,16 +75,23 @@ function extractRoom(detail) {
   return m ? m[1] : "";
 }
 
-// โหลดข้อมูลทรัพย์สิน (A: AssetCode, B: AssetName, C: Project, D: Owner, E: AssetNote)
+// โหลดข้อมูลทรัพย์สินตามโครงสร้าง 8 คอลัมน์ของคุณ
 async function loadAssetsIfNeeded() {
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${ASSET_SHEET}!A:E` });
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${ASSET_SHEET}!A:H` });
   const rows = res.data.values || [];
   const map = new Map();
   for (let i = 1; i < rows.length; i++) {
-    const [code, name, project, owner, note] = rows[i];
+    // A:Code, B:Type, C:Project, D:Unit, E:FullName, F:Owner, G:Active, H:Note
+    const [code, assetType, projectName, unitNo, fullName, owner, active, note] = rows[i];
     if (code) {
       const c = normalizeText(code).toUpperCase();
-      map.set(c, { assetCode: c, assetName: name, project: project, owner: owner, assetNote: note });
+      map.set(c, { 
+        assetCode: c, 
+        assetName: fullName || "", 
+        project: projectName || "", 
+        owner: owner || "", 
+        assetNote: note || "" 
+      });
     }
   }
   return map;
@@ -111,7 +115,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       if (summaryMatch) {
         const targetMonth = summaryMatch[1]; 
         const targetAsset = summaryMatch[2] ? normalizeText(summaryMatch[2]).toUpperCase() : null;
-
         const resData = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_NAME}!A:O` });
         const rows = resData.data.values || [];
         
@@ -137,17 +140,10 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
             }
           }
         }
-
-        let replySum = `📊 สรุปยอด ${targetAsset ? targetAsset : "ภาพรวม"}\n📅 เดือน: ${targetMonth}\n`;
-        replySum += `-------------------------\n`;
-        replySum += `🟢 รับ: ${totalIncome.toLocaleString()} บาท\n`;
-        replySum += `🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n`;
-        replySum += `💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
-        
+        let replySum = `📊 สรุปยอด ${targetAsset ? targetAsset : "ภาพรวม"}\n📅 เดือน: ${targetMonth}\n-------------------------\n🟢 รับ: ${totalIncome.toLocaleString()} บาท\n🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
         if (targetAsset) {
           replySum += `\n-------------------------\n🏠 ชำระค่าเช่าสะสม: ${paymentCount} งวด\n💰 รวมยอดเงิน: ${cumulativeIncome.toLocaleString()} บาท`;
         }
-
         await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: replySum }] });
         continue;
       }
@@ -173,23 +169,23 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const category = await detectCategory(cleanDetail);
       const room = extractRoom(cleanDetail);
 
-      // เรียงข้อมูลลง A-O ให้ครบถ้วน
+      // เรียงข้อมูลลง A-O ให้ครบตามหัวข้อที่คุณต้องการ
       const row = [
-        timeData.full,       // A: Timestamp
-        type,                // B: Type
-        amount,              // C: Amount
-        cleanDetail,         // D: Detail
-        assetCode,           // E: AssetCode
-        asset.assetName || "", // F: AssetName
-        category,            // G: Category
-        room,                // H: Room
-        asset.project || "", // I: Project
-        timeData.monthKey,   // J: Month (2026-03)
-        event.source.userId, // K: User ID
-        paymentMethod,       // L: PaymentMethod
-        ref,                 // M: Ref
-        asset.owner || "",   // N: Owner
-        asset.assetNote || ""// O: AssetNote
+        timeData.full,         // A: Timestamp
+        type,                  // B: Type
+        amount,                // C: Amount
+        cleanDetail,           // D: Detail
+        assetCode,             // E: AssetCode (@C1)
+        asset.assetName || "", // F: AssetName (FullName จาก ASSET คอลัมน์ E)
+        category,              // G: Category
+        room,                  // H: Room
+        asset.project || "",   // I: Project (ProjectName จาก ASSET คอลัมน์ C)
+        timeData.monthKey,     // J: Month (2026-03)
+        event.source.userId,   // K: User ID
+        paymentMethod,         // L: PaymentMethod (#)
+        ref,                   // M: Ref (*)
+        asset.owner || "",     // N: Owner (Owner จาก ASSET คอลัมน์ F)
+        asset.assetNote || ""  // O: AssetNote (Note จาก ASSET คอลัมน์ H)
       ];
 
       await sheets.spreadsheets.values.append({
@@ -200,7 +196,10 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       });
 
       let reply = `บันทึกแล้ว ✅\n${type}: ${amount.toLocaleString()} บาท\nรายการ: ${category}\n`;
-      if (assetCode) reply += `ทรัพย์: ${assetCode} (${asset.owner || ""})\n`;
+      if (assetCode) {
+          // แจ้งชื่อเจ้าของในข้อความตอบกลับเพื่อยืนยันว่าดึงข้อมูลสำเร็จ
+          reply += `ทรัพย์: ${assetCode} (${asset.owner || "ไม่พบข้อมูล"})\n`;
+      }
       reply += `เมื่อ: ${timeData.full}`;
 
       await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: reply.trim() }] });
