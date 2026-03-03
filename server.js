@@ -74,7 +74,10 @@ function getThaiDateTime() {
     month: "2-digit",
   }).format(now);
 
-  return { full: `${d}/${m}/${y} ${hh}:${mm}:${ss}`, monthKey };
+  // ✅ เพิ่ม dateOnly สำหรับ "วันชำระ"
+  const dateOnly = `${d}/${m}/${y}`;
+
+  return { full: `${dateOnly} ${hh}:${mm}:${ss}`, monthKey, dateOnly };
 }
 
 function money(n) {
@@ -259,7 +262,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const userId = event.source?.userId || "";
       const text = normalizeText(event.message.text);
-      const timeData = getThaiDateTime();
+      const timeData = getThaiDateTime(); // ✅ มี dateOnly แล้ว
 
       // 1) SUMMARY: "สรุป 2026-03" หรือ "สรุป 2026-03 @C1"
       const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?\s*$/i);
@@ -385,10 +388,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       await appendDataRow(row);
 
-      // reply format ตามที่คุณอยากได้
+      // ✅ reply format + เพิ่มวันชำระ
       let reply =
         `บันทึกแล้ว ✅\n` +
         `${type} ${money(amount)} บาท\n` +
+        `วันชำระ: ${timeData.dateOnly}\n` +   // ✅ เพิ่มบรรทัดนี้
         `${category}\n` +
         `ทรัพย์: ${assetCode ? `${assetCode}${asset?.assetName ? ` (${asset.assetName})` : ""}` : "(ยังไม่ระบุ)"}`;
 
