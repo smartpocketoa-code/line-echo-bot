@@ -94,7 +94,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const text = normalizeText(event.message.text);
 
-      // --- 1. คำสั่งสรุปยอด ---
+      // --- 1. ส่วนคำสั่งสรุปยอด, นับงวด และยอดสะสม ---
       const summaryMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/i);
       if (summaryMatch) {
         const targetMonth = summaryMatch[1]; 
@@ -108,18 +108,26 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         const rows = resData.data.values || [];
         let totalIncome = 0;
         let totalExpense = 0;
+        let paymentCount = 0;
+        let cumulativeIncome = 0;
 
         for (let i = 1; i < rows.length; i++) {
           const row = rows[i];
-          if (!row[9]) continue; // ถ้าไม่มีคอลัมน์ J (Month) ให้ข้าม
-
           const type = normalizeText(row[1] || ""); 
           const amount = parseFloat(String(row[2] || "0").replace(/,/g, "")) || 0;
           const assetCode = normalizeText(row[4] || "").toUpperCase();
-          const monthKey = normalizeText(row[9] || "");
+          const category = normalizeText(row[6] || ""); 
+          const monthKey = normalizeText(row[9] || ""); 
 
-          if (monthKey === targetMonth) {
-            if (!targetAsset || assetCode === targetAsset) {
+          if (!targetAsset || assetCode === targetAsset) {
+            // นับงวดและยอดสะสมเฉพาะรายการ "ค่าเช่า" ที่สถานะเป็น "รับ"
+            if (type === "รับ" && category.includes("ค่าเช่า")) {
+              paymentCount++;
+              cumulativeIncome += amount;
+            }
+
+            // คำนวณยอดเฉพาะเดือนที่ระบุ
+            if (monthKey === targetMonth) {
               if (type === "รับ") totalIncome += amount;
               else if (type === "จ่าย") totalExpense += amount;
             }
@@ -131,6 +139,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         replySum += `🟢 รับ: ${totalIncome.toLocaleString()} บาท\n`;
         replySum += `🔴 จ่าย: ${totalExpense.toLocaleString()} บาท\n`;
         replySum += `💰 สุทธิ: ${(totalIncome - totalExpense).toLocaleString()} บาท`;
+        
+        if (targetAsset) {
+          replySum += `\n-------------------------\n`;
+          replySum += `🏠 ชำระค่าเช่าสะสม: ${paymentCount} งวด\n`;
+          replySum += `💰 รวมยอดเงิน: ${cumulativeIncome.toLocaleString()} บาท`;
+        }
 
         await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: "text", text: replySum }] });
         continue;
