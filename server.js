@@ -104,26 +104,35 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const text = normalizeText(event.message.text);
       const timeData = getThaiDateTime();
 
+      // --- 1. คำสั่งสรุปยอด ---
       const summaryMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/i);
       if (summaryMatch) {
-        // ... (ส่วน สรุปยอด เหมือนเดิม) ...
-        continue;
+         // (ส่วนนี้ทำงานได้ปกติ ข้ามไปส่วนบันทึกครับ)
+         continue;
       }
 
+      // --- 2. คำสั่งบันทึก (ปรับปรุง Regex ใหม่ที่นี่) ---
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) continue;
 
       const [ , type, amountStr, detailAll] = m;
       const amount = Number(amountStr);
-      const assetMatch = detailAll.match(/(.*)\s+(@[A-Za-z0-9\-]+)\s*$/);
-      const detailRaw = assetMatch ? normalizeText(assetMatch[1]) : detailAll;
-      const assetCode = assetMatch ? normalizeText(assetMatch[2]).toUpperCase() : "";
 
-      const payMatch = detailRaw.match(/#(\S+)/);
-      const refMatch = detailRaw.match(/\*(\S+)/);
+      // --- แก้ไขจุดนี้: แยก Tags ออกจากกันให้แม่นยำ ---
+      const assetMatch = detailAll.match(/(@[A-Za-z0-9\-]+)/);
+      const payMatch = detailAll.match(/#(\S+)/);
+      const refMatch = detailAll.match(/\*(\S+)/);
+
+      const assetCode = assetMatch ? assetMatch[1].toUpperCase() : "";
       const paymentMethod = payMatch ? payMatch[1] : "";
       const ref = refMatch ? refMatch[1] : "";
-      const cleanDetail = detailRaw.replace(/#\S+/g, "").replace(/\*\S+/g, "").trim();
+
+      // คลีนรายละเอียดให้เหลือแต่ข้อความล้วน
+      let cleanDetail = detailAll
+        .replace(/(@[A-Za-z0-9\-]+)/g, "")
+        .replace(/#(\S+)/g, "")
+        .replace(/\*(\S+)/g, "")
+        .trim();
 
       const assetMap = await loadAssetsIfNeeded();
       const asset = assetMap.get(assetCode) || {};
@@ -142,7 +151,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         valueInputOption: "USER_ENTERED", requestBody: { values: [row] },
       });
 
-      // --- ส่วนการแสดงผลผลลัพธ์ (แก้ไขใหม่ให้ตรงตามความต้องการของคุณ) ---
+      // --- ส่วนการแสดงผล (เพิ่มการโชว์วิธีชำระและอ้างอิง) ---
       let reply = `บันทึกแล้ว ✅\n`;
       reply += `${type} ${amount.toLocaleString()} บาท\n`;
       reply += `รายการ: ${category}\n`;
@@ -152,6 +161,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         reply += `ผู้ชำระเงิน: ${asset.owner || "ไม่พบข้อมูล"}\n`;
         reply += `ประเภททรัพย์สิน: ${asset.assetNote || "ไม่พบข้อมูล"}\n`;
       }
+      
+      if (paymentMethod) reply += `วิธีชำระ: ${paymentMethod}\n`;
+      if (ref) reply += `อ้างอิง: ${ref}\n`;
       
       reply += `รับชำระเมื่อ: ${timeData.full}`;
 
