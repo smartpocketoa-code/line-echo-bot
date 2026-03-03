@@ -75,26 +75,30 @@ function extractRoom(detail) {
   return m ? m[1] : "";
 }
 
-// โหลดข้อมูลทรัพย์สินตามโครงสร้าง 8 คอลัมน์ของคุณ
+// โหลดข้อมูลทรัพย์สิน (อ้างอิงลำดับ 8 คอลัมน์: A:Code, B:Type, C:Project, D:Unit, E:FullName, F:Owner, G:Active, H:Note)
 async function loadAssetsIfNeeded() {
-  const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${ASSET_SHEET}!A:H` });
-  const rows = res.data.values || [];
-  const map = new Map();
-  for (let i = 1; i < rows.length; i++) {
-    // A:Code, B:Type, C:Project, D:Unit, E:FullName, F:Owner, G:Active, H:Note
-    const [code, assetType, projectName, unitNo, fullName, owner, active, note] = rows[i];
-    if (code) {
-      const c = normalizeText(code).toUpperCase();
-      map.set(c, { 
-        assetCode: c, 
-        assetName: fullName || "", 
-        project: projectName || "", 
-        owner: owner || "", 
-        assetNote: note || "" 
-      });
+  try {
+    const res = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${ASSET_SHEET}!A:H` });
+    const rows = res.data.values || [];
+    const map = new Map();
+    for (let i = 1; i < rows.length; i++) {
+      const [code, type, project, unit, fullName, owner, active, note] = rows[i];
+      if (code) {
+        const c = normalizeText(code).toUpperCase();
+        map.set(c, { 
+          assetCode: c, 
+          assetName: fullName || "", 
+          project: project || "", 
+          owner: owner || "", 
+          assetNote: note || "" 
+        });
+      }
     }
+    return map;
+  } catch (err) {
+    console.error("Load Assets Error:", err);
+    return new Map();
   }
-  return map;
 }
 
 /* =====================
@@ -110,16 +114,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const text = normalizeText(event.message.text);
       const timeData = getThaiDateTime();
 
-      // --- 1. คำสั่งสรุปยอด ---
+      // --- 1. ส่วนคำสั่งสรุปยอด ---
       const summaryMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@[A-Za-z0-9\-]+))?$/i);
       if (summaryMatch) {
         const targetMonth = summaryMatch[1]; 
         const targetAsset = summaryMatch[2] ? normalizeText(summaryMatch[2]).toUpperCase() : null;
         const resData = await sheets.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: `${SHEET_NAME}!A:O` });
         const rows = resData.data.values || [];
-        
-        let totalIncome = 0; let totalExpense = 0;
-        let paymentCount = 0; let cumulativeIncome = 0;
+        let totalIncome = 0, totalExpense = 0, paymentCount = 0, cumulativeIncome = 0;
 
         for (let i = 1; i < rows.length; i++) {
           const row = rows[i];
@@ -148,46 +150,53 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // --- 2. คำสั่งบันทึก ---
+      // --- 2. ส่วนคำสั่งบันทึก ---
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) continue;
 
       const [ , type, amountStr, detailAll] = m;
       const amount = Number(amountStr);
+      
+      // ดึง @รหัสทรัพย์ ออกจากรายละเอียด
       const assetMatch = detailAll.match(/(.*)\s+(@[A-Za-z0-9\-]+)\s*$/);
       const detailRaw = assetMatch ? normalizeText(assetMatch[1]) : detailAll;
       const assetCode = assetMatch ? normalizeText(assetMatch[2]).toUpperCase() : "";
 
+      // แยก #วิธีจ่าย และ *อ้างอิง
       const payMatch = detailRaw.match(/#(\S+)/);
       const refMatch = detailRaw.match(/\*(\S+)/);
       const paymentMethod = payMatch ? payMatch[1] : "";
       const ref = refMatch ? refMatch[1] : "";
+      
+      // รายละเอียดที่คลีนแล้ว
       const cleanDetail = detailRaw.replace(/#\S+/g, "").replace(/\*\S+/g, "").trim();
 
+      // โหลดข้อมูลทรัพย์สินและหมวดหมู่
       const assetMap = await loadAssetsIfNeeded();
       const asset = assetMap.get(assetCode) || {};
       const category = await detectCategory(cleanDetail);
       const room = extractRoom(cleanDetail);
 
-      // เรียงข้อมูลลง A-O ให้ครบตามหัวข้อที่คุณต้องการ
+      // จัดเรียงข้อมูลลง A-O ให้แม่นยำ (15 คอลัมน์)
       const row = [
         timeData.full,         // A: Timestamp
         type,                  // B: Type
         amount,                // C: Amount
         cleanDetail,           // D: Detail
         assetCode,             // E: AssetCode (@C1)
-        asset.assetName || "", // F: AssetName (FullName จาก ASSET คอลัมน์ E)
+        asset.assetName || "", // F: AssetName (FullName จาก ASSET)
         category,              // G: Category
         room,                  // H: Room
-        asset.project || "",   // I: Project (ProjectName จาก ASSET คอลัมน์ C)
+        asset.project || "",   // I: Project (ProjectName จาก ASSET)
         timeData.monthKey,     // J: Month (2026-03)
         event.source.userId,   // K: User ID
         paymentMethod,         // L: PaymentMethod (#)
         ref,                   // M: Ref (*)
-        asset.owner || "",     // N: Owner (Owner จาก ASSET คอลัมน์ F)
-        asset.assetNote || ""  // O: AssetNote (Note จาก ASSET คอลัมน์ H)
+        asset.owner || "",     // N: Owner (Owner จาก ASSET)
+        asset.assetNote || ""  // O: AssetNote (Note จาก ASSET)
       ];
 
+      // บันทึกลง Google Sheets
       await sheets.spreadsheets.values.append({
         spreadsheetId: SPREADSHEET_ID,
         range: `${SHEET_NAME}!A:O`,
@@ -195,10 +204,10 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         requestBody: { values: [row] },
       });
 
+      // แจ้งผลการบันทึกกลับไปยัง LINE
       let reply = `บันทึกแล้ว ✅\n${type}: ${amount.toLocaleString()} บาท\nรายการ: ${category}\n`;
       if (assetCode) {
-          // แจ้งชื่อเจ้าของในข้อความตอบกลับเพื่อยืนยันว่าดึงข้อมูลสำเร็จ
-          reply += `ทรัพย์: ${assetCode} (${asset.owner || "ไม่พบข้อมูล"})\n`;
+        reply += `ทรัพย์: ${assetCode} (${asset.owner || "ข้อมูลไม่ครบ"})\n`;
       }
       reply += `เมื่อ: ${timeData.full}`;
 
