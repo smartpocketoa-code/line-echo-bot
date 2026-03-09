@@ -105,7 +105,7 @@ function money(n) {
 
 function extractRoom(detail) {
   const m =
-    detail.match(/ห้อง\s*([0-9\/\-]+)/) ||
+    detail.match(/ห้อง\s*([0-9\/\-]+)/i) ||
     detail.match(/([0-9]+\/[0-9]+)/);
   return m ? m[1] : "";
 }
@@ -116,6 +116,7 @@ function extractAssetCodeFromText(detail = "") {
   for (const token of tokens) {
     const t = token.replace(/^@/, "").toUpperCase();
 
+    // รองรับ C1, C2, C-U1, C-R1
     if (/^[A-Z]+(?:-[A-Z0-9]+)*\d+$/.test(t)) {
       return t;
     }
@@ -247,9 +248,7 @@ async function appendDataRow(rowAtoO) {
    SUMMARY
 ===================== */
 async function buildSummary(targetMonth, targetAsset = "") {
-  const mappedTargetAsset = targetAsset
-    ? mapAssetCode(targetAsset)
-    : "";
+  const mappedTargetAsset = targetAsset ? mapAssetCode(targetAsset) : "";
 
   const resData = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -258,8 +257,10 @@ async function buildSummary(targetMonth, targetAsset = "") {
 
   const rows = resData.data.values || [];
 
-  let monthIncome = 0;
+  let monthIncome = 0;   // รายได้จริง ไม่รวมมัดจำ
+  let monthDeposit = 0;  // ค่ามัดจำ
   let monthExpense = 0;
+
   let rentCount = 0;
   let rentTotal = 0;
 
@@ -273,22 +274,30 @@ async function buildSummary(targetMonth, targetAsset = "") {
     const monthKey = normalizeText(r[9] || ""); // J
 
     if (mappedTargetAsset && assetCode !== mappedTargetAsset) continue;
+    if (monthKey !== targetMonth) continue;
 
-    if (monthKey === targetMonth) {
-      if (type === "รับ") monthIncome += amount;
-      if (type === "จ่าย") monthExpense += amount;
+    if (type === "รับ") {
+      if (category === "ค่ามัดจำ") {
+        monthDeposit += amount;
+      } else {
+        monthIncome += amount;
+      }
     }
 
-    if (mappedTargetAsset) {
-      if (type === "รับ" && category === "ค่าเช่า") {
-        rentCount += 1;
-        rentTotal += amount;
-      }
+    if (type === "จ่าย") {
+      monthExpense += amount;
+    }
+
+    // ค่าเช่าสะสม: นับเฉพาะรายรับหมวดค่าเช่า
+    if (mappedTargetAsset && type === "รับ" && category === "ค่าเช่า") {
+      rentCount += 1;
+      rentTotal += amount;
     }
   }
 
   return {
     income: monthIncome,
+    deposit: monthDeposit,
     expense: monthExpense,
     net: monthIncome - monthExpense,
     rentCount,
@@ -313,7 +322,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const text = normalizeText(event.message.text);
       const timeData = getThaiDateTime();
 
-      // 1) SUMMARY: "สรุป 2026-03" หรือ "สรุป 2026-03 C1" หรือ "สรุป 2026-03 @C1"
+      // 1) SUMMARY
+      // รองรับ:
+      // สรุป 2026-03
+      // สรุป 2026-03 C1
+      // สรุป 2026-03 @C1
+      // สรุป 2026-03 C-R1
       const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@?[A-Za-z0-9\-]+))?\s*$/i);
       if (sumMatch) {
         const targetMonth = sumMatch[1];
@@ -328,11 +342,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
             const reply =
               `📊 สรุปยอด ${shownAsset}\n` +
               `📅 เดือน: ${targetMonth}\n` +
-              `🟢 รับ: ${money(s.income)} บาท\n` +
+              `🟢 รายได้: ${money(s.income)} บาท\n` +
+              `🔒 ค่ามัดจำ: ${money(s.deposit)} บาท\n` +
               `🔴 จ่าย: ${money(s.expense)} บาท\n` +
               `💰 สุทธิ: ${money(s.net)} บาท\n` +
               `🏠 ชำระค่าเช่าสะสม: ${s.rentCount} งวด\n` +
-              `💰 รวมยอดเงิน: ${money(s.rentTotal)} บาท`;
+              `💵 รวมค่าเช่า: ${money(s.rentTotal)} บาท`;
 
             await client.replyMessage({
               replyToken: event.replyToken,
@@ -342,7 +357,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
             const reply =
               `📊 สรุปยอด ภาพรวม\n` +
               `📅 เดือน: ${targetMonth}\n` +
-              `🟢 รับรวม: ${money(s.income)} บาท\n` +
+              `🟢 รายได้: ${money(s.income)} บาท\n` +
+              `🔒 ค่ามัดจำ: ${money(s.deposit)} บาท\n` +
               `🔴 จ่ายรวม: ${money(s.expense)} บาท\n` +
               `💰 สุทธิ: ${money(s.net)} บาท`;
 
@@ -367,7 +383,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // 2) RECORD: "รับ/จ่าย ..."
+      // 2) RECORD
+      // รองรับตัวอย่าง:
+      // รับ 5000 ค่าเช่า C1 #โอน *SCB001
+      // รับ 2000 มัดจำ C-R1
+      // จ่าย 120 ค่าน้ำ C-R1
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) {
         await client.replyMessage({
@@ -377,7 +397,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
               type: "text",
               text:
                 "รูปแบบบันทึก:\n" +
-                "รับ 5000 ค่าเช่า ห้อง 278/136 C1 #โอน *SCB001\n" +
+                "รับ 5000 ค่าเช่า C1 #โอน *SCB001\n" +
+                "รับ 2000 มัดจำ C-R1\n" +
                 "จ่าย 120.5 ค่าน้ำ C-R1 #เงินสด *BILL01\n\n" +
                 "สรุป:\n" +
                 "สรุป 2026-03\n" +
@@ -414,6 +435,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const assetMap = await loadAssetsIfNeeded();
       const asset = assetCode ? assetMap.get(assetCode) : null;
 
+      // ถ้าระบุรหัสทรัพย์ แต่ไม่พบในระบบ
       if (assetCode && !asset) {
         await client.replyMessage({
           replyToken: event.replyToken,
@@ -427,6 +449,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
+      // ถ้าทรัพย์ถูกปิดใช้งาน
       if (asset && String(asset.active).toUpperCase() === "FALSE") {
         await client.replyMessage({
           replyToken: event.replyToken,
