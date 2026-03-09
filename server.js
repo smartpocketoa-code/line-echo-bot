@@ -42,17 +42,8 @@ function normalizeText(s = "") {
   return String(s).replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function mapAssetCode(code = "") {
-  const c = normalizeText(code).toUpperCase().replace(/^@/, "");
-
-  const codeMap = {
-    C1: "C-U1",
-    C2: "C-R1",
-    "C-U1": "C-U1",
-    "C-R1": "C-R1",
-  };
-
-  return codeMap[c] || c;
+function normalizeAssetCode(code = "") {
+  return normalizeText(code).toUpperCase().replace(/^@/, "");
 }
 
 function getThaiDateTime() {
@@ -110,15 +101,17 @@ function extractRoom(detail) {
   return m ? m[1] : "";
 }
 
+function isAssetCodeToken(token = "") {
+  const t = normalizeAssetCode(token);
+  return /^[A-Z]+(?:-[A-Z0-9]+)*\d+$/.test(t);
+}
+
 function extractAssetCodeFromText(detail = "") {
   const tokens = normalizeText(detail).split(" ");
 
   for (const token of tokens) {
-    const t = token.replace(/^@/, "").toUpperCase();
-
-    // รองรับ C1, C2, C-U1, C-R1
-    if (/^[A-Z]+(?:-[A-Z0-9]+)*\d+$/.test(t)) {
-      return t;
+    if (isAssetCodeToken(token)) {
+      return normalizeAssetCode(token);
     }
   }
 
@@ -127,11 +120,7 @@ function extractAssetCodeFromText(detail = "") {
 
 function removeAssetCodeFromDetail(detail = "") {
   const tokens = normalizeText(detail).split(" ");
-  const kept = tokens.filter((token) => {
-    const t = token.replace(/^@/, "").toUpperCase();
-    return !/^[A-Z]+(?:-[A-Z0-9]+)*\d+$/.test(t);
-  });
-
+  const kept = tokens.filter((token) => !isAssetCodeToken(token));
   return normalizeText(kept.join(" "));
 }
 
@@ -198,21 +187,45 @@ async function loadAssetsIfNeeded() {
   try {
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
-      range: `${ASSET_SHEET}!A:H`,
+      range: `${ASSET_SHEET}!A:I`,
     });
 
     const rows = res.data.values || [];
     const map = new Map();
 
-    // A AssetCode, B AssetType, C ProjectName, D UnitNo, E FullName, F Owner, G Active, H Note
+    // A AssetCode
+    // B AliasCode
+    // C AssetType
+    // D ProjectName
+    // E UnitNo
+    // F FullName
+    // G Owner
+    // H Active
+    // I Note
+
     for (let i = 1; i < rows.length; i++) {
-      const [code, assetType, project, unit, fullName, owner, active, note] = rows[i];
+      const [
+        code,
+        alias,
+        assetType,
+        project,
+        unit,
+        fullName,
+        owner,
+        active,
+        note,
+      ] = rows[i];
+
       if (!code) continue;
 
-      const c = normalizeText(code).toUpperCase();
+      const mainCode = normalizeAssetCode(code);
+      const aliasRaw = normalizeText(alias || "");
+      const aliasList = aliasRaw
+        ? aliasRaw.split(",").map((x) => normalizeAssetCode(x)).filter(Boolean)
+        : [];
 
-      map.set(c, {
-        assetCode: c,
+      const assetData = {
+        assetCode: mainCode, // รหัสหลักที่ต้องบันทึกลง DATA
         assetType: normalizeText(assetType || ""),
         project: normalizeText(project || ""),
         unit: normalizeText(unit || ""),
@@ -220,7 +233,15 @@ async function loadAssetsIfNeeded() {
         owner: normalizeText(owner || ""),
         active: normalizeText(active || ""),
         assetNote: normalizeText(note || ""),
-      });
+      };
+
+      // ค้นหาด้วยรหัสหลัก
+      map.set(mainCode, assetData);
+
+      // ค้นหาด้วย alias
+      for (const aliasCode of aliasList) {
+        map.set(aliasCode, assetData);
+      }
     }
 
     assetCache = { loadedAt: now, map };
@@ -248,7 +269,14 @@ async function appendDataRow(rowAtoO) {
    SUMMARY
 ===================== */
 async function buildSummary(targetMonth, targetAsset = "") {
-  const mappedTargetAsset = targetAsset ? mapAssetCode(targetAsset) : "";
+  const normalizedTargetAsset = targetAsset ? normalizeAssetCode(targetAsset) : "";
+
+  const assetMap = await loadAssetsIfNeeded();
+  const targetAssetData = normalizedTargetAsset
+    ? assetMap.get(normalizedTargetAsset)
+    : null;
+
+  const finalTargetAsset = targetAssetData?.assetCode || normalizedTargetAsset;
 
   const resData = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -269,11 +297,11 @@ async function buildSummary(targetMonth, targetAsset = "") {
 
     const type = normalizeText(r[1] || ""); // B
     const amount = parseFloat(String(r[2] || "0").replace(/,/g, "")) || 0; // C
-    const assetCode = normalizeText(r[4] || "").toUpperCase(); // E
+    const assetCode = normalizeAssetCode(r[4] || ""); // E
     const category = normalizeText(r[6] || ""); // G
     const monthKey = normalizeText(r[9] || ""); // J
 
-    if (mappedTargetAsset && assetCode !== mappedTargetAsset) continue;
+    if (finalTargetAsset && assetCode !== finalTargetAsset) continue;
     if (monthKey !== targetMonth) continue;
 
     if (type === "รับ") {
@@ -288,8 +316,7 @@ async function buildSummary(targetMonth, targetAsset = "") {
       monthExpense += amount;
     }
 
-    // ค่าเช่าสะสม: นับเฉพาะรายรับหมวดค่าเช่า
-    if (mappedTargetAsset && type === "รับ" && category === "ค่าเช่า") {
+    if (finalTargetAsset && type === "รับ" && category === "ค่าเช่า") {
       rentCount += 1;
       rentTotal += amount;
     }
@@ -302,7 +329,7 @@ async function buildSummary(targetMonth, targetAsset = "") {
     net: monthIncome - monthExpense,
     rentCount,
     rentTotal,
-    mappedTargetAsset,
+    targetAsset: finalTargetAsset,
   };
 }
 
@@ -322,25 +349,35 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const text = normalizeText(event.message.text);
       const timeData = getThaiDateTime();
 
-      // 1) SUMMARY
+      // SUMMARY
       // รองรับ:
       // สรุป 2026-03
-      // สรุป 2026-03 C1
-      // สรุป 2026-03 @C1
+      // สรุป 2026-03 C-U1
+      // สรุป 2026-03 CU1
       // สรุป 2026-03 C-R1
+      // สรุป 2026-03 CR1
       const sumMatch = text.match(/^สรุป\s+(\d{4}-\d{2})(?:\s+(@?[A-Za-z0-9\-]+))?\s*$/i);
       if (sumMatch) {
         const targetMonth = sumMatch[1];
-        const targetAssetInput = sumMatch[2] ? normalizeText(sumMatch[2]).toUpperCase() : "";
+        const targetAssetInput = sumMatch[2] ? normalizeAssetCode(sumMatch[2]) : "";
 
         try {
           const s = await buildSummary(targetMonth, targetAssetInput);
 
           if (targetAssetInput) {
-            const shownAsset = s.mappedTargetAsset || mapAssetCode(targetAssetInput);
+            if (!s.targetAsset) {
+              await client.replyMessage({
+                replyToken: event.replyToken,
+                messages: [{
+                  type: "text",
+                  text: `ไม่พบรหัสทรัพย์ ${targetAssetInput} ในระบบ ❌\nกรุณาตรวจสอบ ASSET Sheet`,
+                }],
+              });
+              continue;
+            }
 
             const reply =
-              `📊 สรุปยอด ${shownAsset}\n` +
+              `📊 สรุปยอด ${s.targetAsset}\n` +
               `📅 เดือน: ${targetMonth}\n` +
               `🟢 รายได้: ${money(s.income)} บาท\n` +
               `🔒 ค่ามัดจำ: ${money(s.deposit)} บาท\n` +
@@ -371,41 +408,39 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           console.error("SUMMARY ERROR:", err);
           await client.replyMessage({
             replyToken: event.replyToken,
-            messages: [
-              {
-                type: "text",
-                text: "สรุปไม่สำเร็จ ❌ กรุณาเช็ค Railway Logs (SUMMARY ERROR)",
-              },
-            ],
+            messages: [{
+              type: "text",
+              text: "สรุปไม่สำเร็จ ❌ กรุณาเช็ค Railway Logs (SUMMARY ERROR)",
+            }],
           });
         }
 
         continue;
       }
 
-      // 2) RECORD
-      // รองรับตัวอย่าง:
-      // รับ 5000 ค่าเช่า C1 #โอน *SCB001
-      // รับ 2000 มัดจำ C-R1
+      // RECORD
+      // ตัวอย่าง:
+      // รับ 5000 ค่าเช่า C-U1 #โอน *SCB001
+      // รับ 5000 ค่าเช่า CU1 #โอน *SCB001
+      // รับ 2000 มัดจำ CR1
       // จ่าย 120 ค่าน้ำ C-R1
       const m = text.match(/^(รับ|จ่าย)\s*(\d+(?:\.\d+)?)\s*(.+)$/i);
       if (!m) {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [
-            {
-              type: "text",
-              text:
-                "รูปแบบบันทึก:\n" +
-                "รับ 5000 ค่าเช่า C1 #โอน *SCB001\n" +
-                "รับ 2000 มัดจำ C-R1\n" +
-                "จ่าย 120.5 ค่าน้ำ C-R1 #เงินสด *BILL01\n\n" +
-                "สรุป:\n" +
-                "สรุป 2026-03\n" +
-                "สรุป 2026-03 C1\n" +
-                "สรุป 2026-03 C-R1",
-            },
-          ],
+          messages: [{
+            type: "text",
+            text:
+              "รูปแบบบันทึก:\n" +
+              "รับ 5000 ค่าเช่า C-U1 #โอน *SCB001\n" +
+              "รับ 5000 ค่าเช่า CU1 #โอน *SCB001\n" +
+              "รับ 2000 มัดจำ C-R1\n" +
+              "จ่าย 120.5 ค่าน้ำ CR1 #เงินสด *BILL01\n\n" +
+              "สรุป:\n" +
+              "สรุป 2026-03\n" +
+              "สรุป 2026-03 C-U1\n" +
+              "สรุป 2026-03 CU1",
+          }],
         });
         continue;
       }
@@ -415,9 +450,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const detailAll = m[3] || "";
       const amount = parseFloat(amountStr);
 
-      const rawAssetCode = extractAssetCodeFromText(detailAll);
-      const assetCode = rawAssetCode ? mapAssetCode(rawAssetCode) : "";
-
+      const inputAssetCode = extractAssetCodeFromText(detailAll);
       const payMatch = detailAll.match(/#([^\s*@#]+)/);
       const refMatch = detailAll.match(/\*([^\s*@#]+)/);
 
@@ -433,32 +466,27 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       );
 
       const assetMap = await loadAssetsIfNeeded();
-      const asset = assetCode ? assetMap.get(assetCode) : null;
+      const asset = inputAssetCode ? assetMap.get(inputAssetCode) : null;
+      const finalAssetCode = asset?.assetCode || "";
 
-      // ถ้าระบุรหัสทรัพย์ แต่ไม่พบในระบบ
-      if (assetCode && !asset) {
+      if (inputAssetCode && !asset) {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [
-            {
-              type: "text",
-              text: `ไม่พบรหัสทรัพย์ ${assetCode} ในระบบ ❌\nกรุณาตรวจสอบ ASSET Sheet`,
-            },
-          ],
+          messages: [{
+            type: "text",
+            text: `ไม่พบรหัสทรัพย์ ${inputAssetCode} ในระบบ ❌\nกรุณาตรวจสอบ ASSET Sheet`,
+          }],
         });
         continue;
       }
 
-      // ถ้าทรัพย์ถูกปิดใช้งาน
       if (asset && String(asset.active).toUpperCase() === "FALSE") {
         await client.replyMessage({
           replyToken: event.replyToken,
-          messages: [
-            {
-              type: "text",
-              text: `ทรัพย์ ${assetCode} ถูกปิดใช้งาน (Active=FALSE) จึงยังไม่บันทึก ❌`,
-            },
-          ],
+          messages: [{
+            type: "text",
+            text: `ทรัพย์ ${finalAssetCode} ถูกปิดใช้งาน (Active=FALSE) จึงยังไม่บันทึก ❌`,
+          }],
         });
         continue;
       }
@@ -471,7 +499,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         type,                   // B Type
         amount,                 // C Amount
         cleanDetail,            // D Detail
-        assetCode,              // E AssetCode
+        finalAssetCode,         // E AssetCode (เก็บรหัสหลักเสมอ)
         asset?.assetName || "", // F AssetName
         category,               // G Category
         room,                   // H Room
@@ -492,7 +520,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         `วันชำระ: ${timeData.dateOnly}\n` +
         `${category}\n` +
         `ห้อง: ${room || "-"}\n` +
-        `ทรัพย์: ${assetCode ? `${assetCode}${asset?.assetName ? ` (${asset.assetName})` : ""}` : "(ยังไม่ระบุ)"}`;
+        `ทรัพย์: ${finalAssetCode ? `${finalAssetCode}${asset?.assetName ? ` (${asset.assetName})` : ""}` : "(ยังไม่ระบุ)"}`;
 
       if (asset?.owner) reply += `\nOwner: ${asset.owner}`;
       if (asset?.assetNote) reply += `\nNote: ${asset.assetNote}`;
